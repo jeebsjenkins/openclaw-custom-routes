@@ -73,11 +73,11 @@ module.exports = {
         });
       }
 
-      // Forward to OpenClaw's Telegram webhook listener
-      log('debug', `Forwarding to OpenClaw`, { url: OPENCLAW_WEBHOOK_URL });
+      // Forward to OpenClaw's inject endpoint (preserves Telegram session routing)
+      log('debug', `Forwarding to OpenClaw inject`, { url: OPENCLAW_INJECT_URL });
       
       const response = await axios.post(
-        OPENCLAW_WEBHOOK_URL,
+        OPENCLAW_INJECT_URL,
         req.body,
         {
           headers: {
