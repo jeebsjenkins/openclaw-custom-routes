@@ -16,6 +16,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "axios": "^1.13.5",
     "express": "^5.2.1",
     "gray-matter": "^4.0.3"
   }
