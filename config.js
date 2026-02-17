@@ -7,6 +7,7 @@ const config = {
   routesDir: process.env.ROUTES_DIR || path.join(__dirname, 'routes'),
   routeScanIntervalMs: parseInt(process.env.ROUTE_SCAN_INTERVAL_MS, 10) || 5000,
   logLevel: process.env.LOG_LEVEL || 'info',
+  workspacePath: process.env.WORKSPACE_PATH || '/Users/nbrown/.openclaw/workspace',
 };
 
 module.exports = config;

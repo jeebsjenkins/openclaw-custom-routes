@@ -2,6 +2,8 @@ const axios = require('axios');
 
 const WEBHOOK_SECRET = '66d03b8c894f5f5acaaf4bd799ddb944a1ae8356b65c5cc20223b6ac1c855108';
 const OPENCLAW_WEBHOOK_URL = 'http://127.0.0.1:8787/telegram-webhook';
+const OPENCLAW_INJECT_URL = 'http://127.0.0.1:18789/inject/telegram';
+
 
 function log(level, message, data = {}) {
   const timestamp = new Date().toISOString();
