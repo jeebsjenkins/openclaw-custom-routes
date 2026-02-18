@@ -105,6 +105,45 @@ await slack.postMessage({
 });
 ```
 
+## Mobey Integration (mobe3 Codebase Assistant)
+
+### `POST /mobey`
+Runs Claude CLI in the mobe3Full workspace to query the codebase. Optionally accepts Slack context for status updates.
+
+**Request:**
+```json
+{
+  "prompt": "What does the InventoryUI do?",
+  "timeout": 300000,
+  "slackContext": {
+    "token": "xoxb-...",
+    "channel": "C0AF2HY0D5M",
+    "thread_ts": "1234567890.123"
+  }
+}
+```
+
+**Slack status updates (if context provided):**
+- 🔍 "Querying codebase..." (on start)
+- ✅ Results + duration (on success)
+- ❌ Error message (on failure/timeout)
+
+### `POST /api/mobey-agent`
+Agent-friendly wrapper that auto-injects Slack context. Designed for OpenClaw agents to call without managing tokens.
+
+**Request:**
+```json
+{
+  "prompt": "List all stored procedures",
+  "thread_ts": "1234567890.123"
+}
+```
+
+Automatically adds Slack context for the `mobey` account (#mobey channel) and posts status updates.
+
+**Configuration:**
+Set `MOBEY_SLACK_TOKEN` in `.env` to override the default token (otherwise uses hardcoded value from `openclaw.json`).
+
 ## Writing a Custom Route
 
 Create a `.js` file in `routes/`:

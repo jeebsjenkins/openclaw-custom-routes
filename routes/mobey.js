@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const slack = require('../src/slack');
 
 const MOBE_DIR = path.join(os.homedir(), 'Projects', 'mobe3Full');
 const TIMEOUT_MS = 5 * 60 * 1000;
@@ -35,7 +36,7 @@ module.exports = {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { prompt, timeout } = req.body || {};
+    const { prompt, timeout, slackContext } = req.body || {};
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid "prompt" in request body' });
@@ -45,9 +46,25 @@ module.exports = {
       return res.status(429).json({ error: 'Too many concurrent requests' });
     }
 
+    // Optional Slack status updates
+    const hasSlack = slackContext?.token && slackContext?.channel;
+    const slackOpts = hasSlack ? {
+      token: slackContext.token,
+      channel: slackContext.channel,
+      thread_ts: slackContext.thread_ts,
+    } : null;
+
     running++;
     const startedAt = Date.now();
     const timeoutMs = Math.min(timeout || TIMEOUT_MS, TIMEOUT_MS);
+
+    // Post initial status to Slack
+    if (slackOpts) {
+      slack.postMessage({
+        ...slackOpts,
+        text: '🔍 Querying mobe3 codebase... (this may take up to 5 minutes)',
+      }).catch(err => console.error('[mobey] Failed to post start status:', err.message));
+    }
 
     function send(event, data) {
       if (!STREAM_UPDATES) return;
@@ -120,26 +137,66 @@ module.exports = {
       stderr += chunk;
     });
 
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       proc.kill('SIGTERM');
       send('error', { error: 'Claude CLI timed out', timeoutMs });
+
+      if (slackOpts) {
+        await slack.postMessage({
+          ...slackOpts,
+          text: `⏱️ Query timed out after ${timeoutMs / 1000}s`,
+        }).catch(err => console.error('[mobey] Failed to post timeout:', err.message));
+      }
+
       if (!STREAM_UPDATES) return res.status(504).json({ error: 'Claude CLI timed out', timeoutMs });
       res.end();
     }, timeoutMs);
 
-    proc.on('close', (code, signal) => {
+    proc.on('close', async (code, signal) => {
       clearTimeout(timer);
       running--;
       const durationMs = Date.now() - startedAt;
+      const durationSec = (durationMs / 1000).toFixed(1);
 
       if (signal) {
         send('error', { error: 'Claude CLI was killed', signal, durationMs });
+        
+        if (slackOpts) {
+          await slack.postMessage({
+            ...slackOpts,
+            text: `❌ Query was killed (signal: ${signal}) after ${durationSec}s`,
+          }).catch(err => console.error('[mobey] Failed to post error:', err.message));
+        }
+
         if (!STREAM_UPDATES) return res.status(504).json({ error: 'Claude CLI was killed', signal, durationMs });
       } else if (code !== 0) {
         send('error', { error: stderr || `exit code ${code}`, code, durationMs });
+
+        if (slackOpts) {
+          await slack.postMessage({
+            ...slackOpts,
+            text: `❌ Query failed (exit code ${code}) after ${durationSec}s\n\`\`\`\n${stderr || '(no error output)'}\`\`\``,
+          }).catch(err => console.error('[mobey] Failed to post error:', err.message));
+        }
+
         if (!STREAM_UPDATES) return res.status(502).json({ error: stderr || `exit code ${code}`, code, durationMs });
       } else {
         send('done', { markdown: fullText.trim(), prompt, durationMs });
+
+        if (slackOpts) {
+          const result = fullText.trim();
+          // If result is too long, truncate with link to full output
+          const maxLen = 3000;
+          const displayText = result.length > maxLen 
+            ? result.substring(0, maxLen) + '\n\n_(truncated - result too long)_'
+            : result;
+
+          await slack.postMessage({
+            ...slackOpts,
+            text: `✅ Query complete (${durationSec}s)\n\n${displayText}`,
+          }).catch(err => console.error('[mobey] Failed to post result:', err.message));
+        }
+
         if (!STREAM_UPDATES) return res.json({ markdown: fullText.trim(), prompt, durationMs });
       }
 
