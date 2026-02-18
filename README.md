@@ -84,6 +84,27 @@ Lists tasks for an agent by reading markdown files from `workspace/tasks/{agentI
 
 Lists all discovered routes (for diagnostics).
 
+## Slack Integration
+
+Custom routes can receive Slack context from OpenClaw handlers and post status updates back to Slack independently. This enables async processing with live status updates.
+
+See **[SLACK.md](./SLACK.md)** for complete documentation on:
+- Passing Slack context from handlers to custom routes
+- Using the `src/slack.js` utility to post messages back
+- Complete working example in `routes/example-slack-async.js`
+
+**Quick example:**
+```javascript
+const slack = require('../src/slack');
+
+await slack.postMessage({
+  token: slackContext.token,
+  channel: slackContext.channel,
+  thread_ts: slackContext.thread_ts,
+  text: '✅ Processing complete!'
+});
+```
+
 ## Writing a Custom Route
 
 Create a `.js` file in `routes/`:
