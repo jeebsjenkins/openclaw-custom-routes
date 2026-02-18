@@ -3,14 +3,28 @@ const path = require('path');
 const os = require('os');
 
 const MOBE_DIR = path.join(os.homedir(), 'Projects', 'mobe3Full');
+const TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_CONCURRENT = 3;
 
 let running = 0;
 
+function cleanEnv() {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key === 'CLAUDECODE') continue;
+    if (key === 'NODE_OPTIONS') continue;
+    if (key.startsWith('CLAUDE_CODE')) continue;
+    if (key.startsWith('VSCODE')) continue;
+    if (key.startsWith('ELECTRON')) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
 module.exports = {
   path: '/mobey',
   method: 'post',
-  description: 'Run a prompt through Claude CLI in mobe3Full workspace',
+  description: 'Run a prompt through Claude CLI in mobe3Full workspace (SSE streaming)',
 
   handler(req, res) {
     const ip = req.ip || req.connection.remoteAddress;
@@ -20,7 +34,7 @@ module.exports = {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { prompt } = req.body || {};
+    const { prompt, timeout } = req.body || {};
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid "prompt" in request body' });
@@ -32,49 +46,107 @@ module.exports = {
 
     running++;
     const startedAt = Date.now();
+    const timeoutMs = Math.min(timeout || TIMEOUT_MS, TIMEOUT_MS);
 
-    // Clean env: strip CLAUDE*, VSCODE*, ELECTRON*, and NODE_OPTIONS
-    const env = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (key === 'CLAUDECODE') continue;
-      if (key === 'NODE_OPTIONS') continue;
-      if (key.startsWith('CLAUDE_CODE')) continue;
-      if (key.startsWith('VSCODE')) continue;
-      if (key.startsWith('ELECTRON')) continue;
-      env[key] = value;
-    }
-
-    const proc = spawn('claude', ['-p', prompt], {
-      cwd: MOBE_DIR,
-      stdio: ['inherit', 'pipe', 'pipe'],
-      env,
+    // SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
     });
 
-    let stdout = '';
+    function send(event, data) {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+
+    send('start', { prompt });
+
+    const proc = spawn('claude', ['-p', '--verbose', '--output-format', 'stream-json', prompt], {
+      cwd: MOBE_DIR,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      env: cleanEnv(),
+    });
+
+    let fullText = '';
     let stderr = '';
+    let lineBuf = '';
 
-    proc.stdout.on('data', (chunk) => { stdout += chunk; });
-    proc.stderr.on('data', (chunk) => { stderr += chunk; });
+    proc.stdout.on('data', (chunk) => {
+      lineBuf += chunk.toString();
+      const lines = lineBuf.split('\n');
+      lineBuf = lines.pop(); // keep incomplete line in buffer
 
-    proc.on('close', (code) => {
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+
+          if (evt.type === 'assistant' && evt.message?.content) {
+            for (const block of evt.message.content) {
+              if (block.type === 'thinking' && block.thinking) {
+                send('thinking', { text: block.thinking });
+              } else if (block.type === 'text' && block.text) {
+                fullText += block.text;
+                send('text', { text: block.text });
+              }
+            }
+          } else if (evt.type === 'content_block_delta') {
+            if (evt.delta?.type === 'thinking_delta' && evt.delta.thinking) {
+              send('thinking', { text: evt.delta.thinking });
+            } else if (evt.delta?.type === 'text_delta' && evt.delta.text) {
+              fullText += evt.delta.text;
+              send('text', { text: evt.delta.text });
+            }
+          } else if (evt.type === 'result') {
+            // final result — fullText already built from deltas
+            if (evt.result && !fullText) {
+              fullText = evt.result;
+            }
+          } else {
+            // tool_use, system, etc.
+            send('event', evt);
+          }
+        } catch {
+          // non-JSON line
+          fullText += line;
+          send('text', { text: line });
+        }
+      }
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM');
+      send('error', { error: 'Claude CLI timed out', timeoutMs });
+      res.end();
+    }, timeoutMs);
+
+    proc.on('close', (code, signal) => {
+      clearTimeout(timer);
       running--;
       const durationMs = Date.now() - startedAt;
 
-      if (code !== 0) {
-        return res.status(500).json({
-          error: stderr || `exit code ${code}`,
-          code,
-          prompt,
-          stdout: stdout.trim(),
-          durationMs,
-        });
+      if (signal) {
+        send('error', { error: 'Claude CLI was killed', signal, durationMs });
+      } else if (code !== 0) {
+        send('error', { error: stderr || `exit code ${code}`, code, durationMs });
+      } else {
+        send('done', { markdown: fullText.trim(), prompt, durationMs });
       }
 
-      res.json({
-        markdown: stdout.trim(),
-        prompt,
-        durationMs,
-      });
+      res.end();
+    });
+
+    // Clean up if client disconnects
+    res.on('close', () => {
+      if (!proc.killed) {
+        proc.kill('SIGTERM');
+        clearTimeout(timer);
+        running--;
+      }
     });
   },
 };
