@@ -8,6 +8,8 @@ const config = {
   routeScanIntervalMs: parseInt(process.env.ROUTE_SCAN_INTERVAL_MS, 10) || 5000,
   logLevel: process.env.LOG_LEVEL || 'info',
   workspacePath: process.env.WORKSPACE_PATH || '/Users/nbrown/.openclaw/workspace',
+  openclawGateway: process.env.OPENCLAW_GATEWAY,
+  openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
 };
 
 module.exports = config;

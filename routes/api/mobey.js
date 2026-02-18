@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const { sendSlackMessage } = require('../../src/gatewayHelper');
 
 const MOBE_DIR = path.join(os.homedir(), 'Projects', 'mobe3Full');
 const TIMEOUT_MS = 5 * 60 * 1000;
@@ -27,7 +28,7 @@ module.exports = {
   method: 'post',
   description: 'Run a prompt through Claude CLI in mobe3Full workspace (SSE streaming)',
 
-  handler(req, res) {
+  async handler(req, res) {
     const ip = req.ip || req.connection.remoteAddress;
     const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ip);
 
@@ -35,7 +36,14 @@ module.exports = {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { prompt, timeout } = req.body || {};
+    const { prompt, timeout, slack } = req.body || {};
+
+    // DEBUG: intercept and just send simple slack reply
+    if (slack) {
+      const slackRes = await sendSlackMessage({ target: slack.channel, message: 'yo', replyTo: slack.thread_ts })
+      res.json(slackRes);
+      return;
+    }
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid "prompt" in request body' });
