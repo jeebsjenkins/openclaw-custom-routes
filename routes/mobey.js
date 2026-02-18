@@ -5,6 +5,7 @@ const os = require('os');
 const MOBE_DIR = path.join(os.homedir(), 'Projects', 'mobe3Full');
 const TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_CONCURRENT = 3;
+const STREAM_UPDATES = false; // flip to true to re-enable SSE streaming
 
 let running = 0;
 
@@ -48,18 +49,19 @@ module.exports = {
     const startedAt = Date.now();
     const timeoutMs = Math.min(timeout || TIMEOUT_MS, TIMEOUT_MS);
 
-    // SSE headers
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-
     function send(event, data) {
+      if (!STREAM_UPDATES) return;
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     }
 
-    send('start', { prompt });
+    if (STREAM_UPDATES) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      send('start', { prompt });
+    }
 
     const proc = spawn('claude', ['-p', '--verbose', '--output-format', 'stream-json', prompt], {
       cwd: MOBE_DIR,
@@ -121,6 +123,7 @@ module.exports = {
     const timer = setTimeout(() => {
       proc.kill('SIGTERM');
       send('error', { error: 'Claude CLI timed out', timeoutMs });
+      if (!STREAM_UPDATES) return res.status(504).json({ error: 'Claude CLI timed out', timeoutMs });
       res.end();
     }, timeoutMs);
 
@@ -131,10 +134,13 @@ module.exports = {
 
       if (signal) {
         send('error', { error: 'Claude CLI was killed', signal, durationMs });
+        if (!STREAM_UPDATES) return res.status(504).json({ error: 'Claude CLI was killed', signal, durationMs });
       } else if (code !== 0) {
         send('error', { error: stderr || `exit code ${code}`, code, durationMs });
+        if (!STREAM_UPDATES) return res.status(502).json({ error: stderr || `exit code ${code}`, code, durationMs });
       } else {
         send('done', { markdown: fullText.trim(), prompt, durationMs });
+        if (!STREAM_UPDATES) return res.json({ markdown: fullText.trim(), prompt, durationMs });
       }
 
       res.end();
