@@ -51,10 +51,14 @@ module.exports = {
       }
 
       // Forward to OpenClaw's Gmail webhook listener
-      log('debug', `Forwarding to OpenClaw`, { url: OPENCLAW_GMAIL_URL });
+      // Pass the token from query string (Google sends it as ?token=...)
+      const token = req.query.token;
+      const forwardUrl = token ? `${OPENCLAW_GMAIL_URL}?token=${token}` : OPENCLAW_GMAIL_URL;
+      
+      log('debug', `Forwarding to OpenClaw`, { url: forwardUrl, hasToken: !!token });
       
       const response = await axios.post(
-        OPENCLAW_GMAIL_URL,
+        forwardUrl,
         req.body,
         {
           headers: {
