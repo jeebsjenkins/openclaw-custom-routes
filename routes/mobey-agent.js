@@ -14,8 +14,8 @@ const axios = require('axios');
  * }
  */
 
-// Slack credentials for mobey account (from openclaw.json)
-const SLACK_TOKEN = process.env.MOBEY_SLACK_TOKEN || 'REDACTED_TOKEN';
+// Slack credentials for mobey account (set via environment variable)
+const SLACK_TOKEN = process.env.MOBEY_SLACK_TOKEN;
 const SLACK_CHANNEL = 'C0AF2HY0D5M'; // #mobey channel
 
 module.exports = {
