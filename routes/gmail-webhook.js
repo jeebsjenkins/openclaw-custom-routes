@@ -1,9 +1,7 @@
 const axios = require('axios');
 
-// Forward to OpenClaw gateway hooks endpoint
-const OPENCLAW_GMAIL_URL = 'http://127.0.0.1:18789/hooks/gmail';
-// Internal hooks token (for auth to OpenClaw gateway)
-const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '4413a40184f6c46ef6134f1f42f7f19f62608dad1536b7a2';
+// Forward to OpenClaw gmail server (fetches email content, then calls hooks)
+const OPENCLAW_GMAIL_URL = 'http://127.0.0.1:8788/';
 
 function log(level, message, data = {}) {
   const timestamp = new Date().toISOString();
@@ -52,27 +50,18 @@ module.exports = {
         }
       }
 
-      // Forward to OpenClaw's Gmail webhook listener
-      // Google's pushToken (from query string) is for verifying the request came from Google
-      // We use the internal hooks.token for auth to OpenClaw
-      const googlePushToken = req.query.token;
-      
-      log('debug', `Forwarding to OpenClaw`, { 
-        url: OPENCLAW_GMAIL_URL, 
-        hasGoogleToken: !!googlePushToken,
-        hasHooksToken: !!OPENCLAW_HOOKS_TOKEN 
-      });
+      // Forward to OpenClaw's Gmail server (8788)
+      // This server fetches the actual email via Gmail API, then calls /hooks/gmail
+      log('debug', `Forwarding to OpenClaw Gmail server`, { url: OPENCLAW_GMAIL_URL });
       
       const response = await axios.post(
         OPENCLAW_GMAIL_URL,
         req.body,
         {
           headers: {
-            'Content-Type': 'application/json',
-            // Use internal hooks token for OpenClaw auth
-            'Authorization': `Bearer ${OPENCLAW_HOOKS_TOKEN}`
+            'Content-Type': 'application/json'
           },
-          timeout: 10000,
+          timeout: 30000, // Gmail API fetch may take longer
           validateStatus: () => true // Don't throw on non-2xx
         }
       );
