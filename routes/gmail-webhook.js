@@ -2,6 +2,8 @@ const axios = require('axios');
 
 // Forward to OpenClaw gateway hooks endpoint
 const OPENCLAW_GMAIL_URL = 'http://127.0.0.1:18789/hooks/gmail';
+// Internal hooks token (for auth to OpenClaw gateway)
+const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '4413a40184f6c46ef6134f1f42f7f19f62608dad1536b7a2';
 
 function log(level, message, data = {}) {
   const timestamp = new Date().toISOString();
@@ -51,10 +53,15 @@ module.exports = {
       }
 
       // Forward to OpenClaw's Gmail webhook listener
-      // Pass the token from query string as Authorization header (OpenClaw requires header auth)
-      const token = req.query.token;
+      // Google's pushToken (from query string) is for verifying the request came from Google
+      // We use the internal hooks.token for auth to OpenClaw
+      const googlePushToken = req.query.token;
       
-      log('debug', `Forwarding to OpenClaw`, { url: OPENCLAW_GMAIL_URL, hasToken: !!token });
+      log('debug', `Forwarding to OpenClaw`, { 
+        url: OPENCLAW_GMAIL_URL, 
+        hasGoogleToken: !!googlePushToken,
+        hasHooksToken: !!OPENCLAW_HOOKS_TOKEN 
+      });
       
       const response = await axios.post(
         OPENCLAW_GMAIL_URL,
@@ -62,8 +69,8 @@ module.exports = {
         {
           headers: {
             'Content-Type': 'application/json',
-            // Pass token as Bearer auth (OpenClaw requires header, not query param)
-            ...(token && { 'Authorization': `Bearer ${token}` })
+            // Use internal hooks token for OpenClaw auth
+            'Authorization': `Bearer ${OPENCLAW_HOOKS_TOKEN}`
           },
           timeout: 10000,
           validateStatus: () => true // Don't throw on non-2xx
