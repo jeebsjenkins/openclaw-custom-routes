@@ -1,6 +1,8 @@
+require('dotenv').config();
 const express = require('express');
 const config = require('../config');
 const RouteLoader = require('./loader');
+const gateway = require('./gateway');
 
 // Simple structured logger
 const log = {
@@ -68,12 +70,25 @@ app.use((err, _req, res, _next) => {
 
 // --- Start ---
 
-app.listen(config.port, config.host, () => {
-  log.info(`OpenClaw Custom Routes server listening on ${config.host}:${config.port}`);
-  log.info(`Workspace path: ${config.workspacePath}`);
-  log.info(`Routes directory: ${config.routesDir}`);
-  const routes = loader.list();
-  log.info(`Discovered ${routes.length} route(s): ${routes.map(r => `${r.method} ${r.path}`).join(', ') || '(none)'}`);
-});
+async function start() {
+  // Connect to OpenClaw gateway
+  try {
+    await gateway.connect();
+    log.info(`Connected to OpenClaw gateway at ${config.openclawGateway}`);
+  } catch (err) {
+    log.error(`Failed to connect to OpenClaw gateway: ${err.message}`);
+    process.exit(1);
+  }
+
+  app.listen(config.port, config.host, () => {
+    log.info(`OpenClaw Custom Routes server listening on ${config.host}:${config.port}`);
+    log.info(`Workspace path: ${config.workspacePath}`);
+    log.info(`Routes directory: ${config.routesDir}`);
+    const routes = loader.list();
+    log.info(`Discovered ${routes.length} route(s): ${routes.map(r => `${r.method} ${r.path}`).join(', ') || '(none)'}`);
+  });
+}
+
+start();
 
 module.exports = app;

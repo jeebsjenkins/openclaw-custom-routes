@@ -8,6 +8,11 @@ const config = {
   routeScanIntervalMs: parseInt(process.env.ROUTE_SCAN_INTERVAL_MS, 10) || 5000,
   logLevel: process.env.LOG_LEVEL || 'info',
   workspacePath: process.env.WORKSPACE_PATH || '/Users/nbrown/.openclaw/workspace',
+  openclawGateway: process.env.OPENCLAW_GATEWAY,
+  openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
+  mobeySlackBotToken: process.env.MOBEY_SLACK_BOT_TOKEN,
+  fastmailUser: process.env.FASTMAIL_USER,
+  fastmailAppPassword: process.env.FASTMAIL_APP_PASSWORD,
 };
 
 module.exports = config;

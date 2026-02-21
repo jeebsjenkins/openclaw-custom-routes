@@ -20,15 +20,8 @@ class RouteLoader {
       return [];
     }
 
-    const files = fs.readdirSync(this.routesDir).filter(f => f.endsWith('.js'));
     const discovered = new Map();
-
-    for (const file of files) {
-      const route = this._loadModule(file);
-      if (route) {
-        discovered.set(file, route);
-      }
-    }
+    this._scanDir(this.routesDir, '', discovered);
 
     // Detect added and removed routes
     const added = [];
@@ -53,11 +46,30 @@ class RouteLoader {
   }
 
   /**
+   * Recursively scan a directory for .js route files.
+   * prefix is the path segment derived from subfolder structure (e.g. '/api').
+   */
+  _scanDir(dir, prefix, discovered) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        this._scanDir(path.join(dir, entry.name), `${prefix}/${entry.name}`, discovered);
+      } else if (entry.isFile() && entry.name.endsWith('.js')) {
+        const relFile = prefix ? `${prefix.slice(1)}/${entry.name}` : entry.name;
+        const route = this._loadModule(path.join(dir, entry.name), prefix, relFile);
+        if (route) {
+          discovered.set(relFile, route);
+        }
+      }
+    }
+  }
+
+  /**
    * Load a single route module, clearing the require cache so changes
    * are picked up without a restart.
    */
-  _loadModule(file) {
-    const filePath = path.join(this.routesDir, file);
+  _loadModule(filePath, prefix, relFile) {
     try {
       // Clear require cache for hot-reload
       delete require.cache[require.resolve(filePath)];
@@ -65,26 +77,26 @@ class RouteLoader {
 
       for (const key of REQUIRED_EXPORTS) {
         if (!(key in mod)) {
-          this.log.warn(`Route ${file} missing required export "${key}" — skipped`);
+          this.log.warn(`Route ${relFile} missing required export "${key}" — skipped`);
           return null;
         }
       }
 
       const method = mod.method.toLowerCase();
       if (!['get', 'post', 'put', 'patch', 'delete'].includes(method)) {
-        this.log.warn(`Route ${file} has unsupported method "${mod.method}" — skipped`);
+        this.log.warn(`Route ${relFile} has unsupported method "${mod.method}" — skipped`);
         return null;
       }
 
       return {
-        file,
-        path: mod.path,
+        file: relFile,
+        path: prefix + mod.path,
         method,
         handler: mod.handler,
         description: mod.description || '',
       };
     } catch (err) {
-      this.log.error(`Failed to load route ${file}: ${err.message}`);
+      this.log.error(`Failed to load route ${relFile}: ${err.message}`);
       return null;
     }
   }
