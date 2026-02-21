@@ -51,20 +51,19 @@ module.exports = {
       }
 
       // Forward to OpenClaw's Gmail webhook listener
-      // Pass the token from query string (Google sends it as ?token=...)
+      // Pass the token from query string as Authorization header (OpenClaw requires header auth)
       const token = req.query.token;
-      const forwardUrl = token ? `${OPENCLAW_GMAIL_URL}?token=${token}` : OPENCLAW_GMAIL_URL;
       
-      log('debug', `Forwarding to OpenClaw`, { url: forwardUrl, hasToken: !!token });
+      log('debug', `Forwarding to OpenClaw`, { url: OPENCLAW_GMAIL_URL, hasToken: !!token });
       
       const response = await axios.post(
-        forwardUrl,
+        OPENCLAW_GMAIL_URL,
         req.body,
         {
           headers: {
             'Content-Type': 'application/json',
-            // Forward any auth headers
-            ...(req.headers['authorization'] && { 'Authorization': req.headers['authorization'] })
+            // Pass token as Bearer auth (OpenClaw requires header, not query param)
+            ...(token && { 'Authorization': `Bearer ${token}` })
           },
           timeout: 10000,
           validateStatus: () => true // Don't throw on non-2xx
