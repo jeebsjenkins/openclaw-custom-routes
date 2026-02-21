@@ -1,16 +1,12 @@
 require('dotenv').config();
-const gateway = require('../src/gateway');
-const { sendSlackMessage } = require('../src/gatewayHelper');
+const { sendSlackMessage } = require('../src/slackHelper');
 
 async function main() {
-  console.log('Connecting to gateway...');
-  await gateway.connect();
-  console.log('Connected. Sending Slack message...');
+  console.log('Sending Slack message...');
 
   const res = await sendSlackMessage({
-    target: '#mobey',
+    channel: '#mobey',
     message: 'yo',
-    replyTo: null,
   });
 
   console.log('Response:', JSON.stringify(res, null, 2));
