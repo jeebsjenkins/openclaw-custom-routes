@@ -1,7 +1,7 @@
 const axios = require('axios');
 
-// OpenClaw Gmail hook server runs on port 8788
-const OPENCLAW_GMAIL_URL = 'http://127.0.0.1:8788/';
+// Forward to OpenClaw gateway hooks endpoint
+const OPENCLAW_GMAIL_URL = 'http://127.0.0.1:18789/hooks/gmail';
 
 function log(level, message, data = {}) {
   const timestamp = new Date().toISOString();
