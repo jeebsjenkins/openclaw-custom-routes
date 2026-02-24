@@ -3,6 +3,8 @@ const express = require('express');
 const config = require('../config');
 const RouteLoader = require('./loader');
 const gateway = require('./gateway');
+const claudeSocket = require('./claudeSocket');
+const { claudeStream } = require('./claudeHelper');
 
 // Simple structured logger
 const log = {
@@ -87,6 +89,23 @@ async function start() {
     const routes = loader.list();
     log.info(`Discovered ${routes.length} route(s): ${routes.map(r => `${r.method} ${r.path}`).join(', ') || '(none)'}`);
   });
+
+  // Start Claude WebSocket server (non-blocking — warn on failure, don't crash)
+  if (config.claudeSocketToken) {
+    try {
+      claudeSocket.start({
+        port: config.claudeSocketPort,
+        host: config.host,
+        token: config.claudeSocketToken,
+        claudeStreamFn: claudeStream,
+        log,
+      });
+    } catch (err) {
+      log.warn(`Failed to start Claude WebSocket server: ${err.message}`);
+    }
+  } else {
+    log.info('CLAUDE_SOCKET_TOKEN not set — Claude WebSocket server disabled');
+  }
 }
 
 start();

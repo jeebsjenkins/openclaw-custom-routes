@@ -13,6 +13,8 @@ const config = {
   mobeySlackBotToken: process.env.MOBEY_SLACK_BOT_TOKEN,
   fastmailUser: process.env.FASTMAIL_USER,
   fastmailAppPassword: process.env.FASTMAIL_APP_PASSWORD,
+  claudeSocketPort: parseInt(process.env.CLAUDE_SOCKET_PORT, 10) || 3101,
+  claudeSocketToken: process.env.CLAUDE_SOCKET_TOKEN,
 };
 
 module.exports = config;
