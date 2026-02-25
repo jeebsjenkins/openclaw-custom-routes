@@ -71,6 +71,45 @@ async function getUserInfo(username, refreshCache = false) {
   ) || null;
 }
 
+/**
+ * Fetch message history for a Slack thread.
+ * @param {Object} options
+ * @param {string} options.channel - Slack channel ID
+ * @param {string} options.threadTs - Parent message timestamp
+ * @param {number} [options.limit=20] - Max messages to fetch
+ * @returns {Promise<Array<{user: string, text: string, ts: string}>>}
+ */
+async function fetchThreadHistory({ channel, threadTs, limit = 20 }) {
+  const result = await slack.conversations.replies({
+    channel,
+    ts: threadTs,
+    limit,
+  });
+  return (result.messages || []).map(m => ({
+    user: m.user,
+    text: m.text,
+    ts: m.ts,
+  }));
+}
+
+/**
+ * Find the most recent message from a user in a channel.
+ * Returns the message's ts (usable as thread_ts) or null.
+ * @param {Object} options
+ * @param {string} options.channel - Slack channel ID
+ * @param {string} options.userId - Slack user ID (U...)
+ * @param {number} [options.limit=50] - How many recent messages to scan
+ * @returns {Promise<string|null>} The message ts, or null if not found
+ */
+async function findRecentUserMessage({ channel, userId, limit = 10 }) {
+  const result = await slack.conversations.history({
+    channel,
+    limit,
+  });
+  const msg = (result.messages || []).find(m => m.user === userId);
+  return msg?.ts || null;
+}
+
 async function uploadSlackFile({ channel, content, filename, title, threadTs }) {
   return slack.files.uploadV2({
     channel_id: channel,
@@ -97,6 +136,8 @@ module.exports = {
   sendSlackMessage,
   updateSlackMessage,
   uploadSlackFile,
+  fetchThreadHistory,
+  findRecentUserMessage,
   getUserInfo,
   mdToSlack,
 };

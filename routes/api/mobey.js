@@ -1,7 +1,7 @@
 const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
-const { sendSlackMessage, updateSlackMessage, uploadSlackFile, getUserInfo, mdToSlack } = require('../../src/slackHelper');
+const { sendSlackMessage, updateSlackMessage, uploadSlackFile, fetchThreadHistory, findRecentUserMessage, getUserInfo, mdToSlack } = require('../../src/slackHelper');
 const { mdToDocx, mdToHtml, mdToPdf, mdToTxt } = require('../../src/mdConverter');
 const { sendEmail } = require('../../src/emailHelper');
 const { claudeStream, cleanEnv } = require('../../src/claudeHelper');
@@ -115,10 +115,13 @@ function createStatusUpdater({ statusMsg, header, res }) {
   return updateSlackStatus;
 }
 
-async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_email, format, prompt, slackUser }) {
+async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_email, format, prompt, slackUser, shortPrompt }) {
   const fmt = FORMAT_CONFIG[format] ? format : 'md';
   const cfg = FORMAT_CONFIG[fmt];
   const explicitFormat = format && format !== 'md' && FORMAT_CONFIG[format];
+  const slug = shortPrompt ? shortPrompt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : null;
+  const fileLabel = slug || 'response';
+  const titleLabel = shortPrompt ? `Mobey: ${shortPrompt}` : 'Mobey Response';
 
   // Send email if requested
   if (respond_email && answer.ok) {
@@ -133,7 +136,7 @@ async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_e
       } else if (explicitFormat && cfg.convert) {
         const buf = await cfg.convert(answer.markdown);
         emailOpts.text = 'See attached file.';
-        emailOpts.attachments = [{ filename: `response.${cfg.ext}`, content: buf, contentType: cfg.contentType }];
+        emailOpts.attachments = [{ filename: `${fileLabel}.${cfg.ext}`, content: buf, contentType: cfg.contentType }];
       } else {
         emailOpts.text = answer.markdown;
       }
@@ -162,9 +165,9 @@ async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_e
       await uploadSlackFile({
         channel: statusMsg.channel,
         content,
-        filename: `response.${cfg.ext}`,
-        title: 'Mobey Response',
-        threadTs: statusMsg.ts,
+        filename: `${fileLabel}.${cfg.ext}`,
+        title: titleLabel,
+        threadTs: statusMsg.threadTs,
       });
     } else if (answer.markdown.length < SLACK_INLINE_LIMIT) {
       updateSlackStatus('text', { text: mdToSlack(answer.markdown) });
@@ -173,9 +176,9 @@ async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_e
       await uploadSlackFile({
         channel: statusMsg.channel,
         content: answer.markdown,
-        filename: 'response.md',
-        title: 'Mobey Response',
-        threadTs: statusMsg.ts,
+        filename: `${fileLabel}.md`,
+        title: titleLabel,
+        threadTs: statusMsg.threadTs,
       });
     }
   }
@@ -192,7 +195,7 @@ async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_e
     if (cfg.convert) {
       const buf = await cfg.convert(answer.markdown);
       res.set('Content-Type', cfg.contentType);
-      res.set('Content-Disposition', `attachment; filename="response.${cfg.ext}"`);
+      res.set('Content-Disposition', `attachment; filename="${fileLabel}.${cfg.ext}"`);
       res.send(buf);
     } else {
       res.json({ status: 'ok', markdown: answer.markdown, prompt: answer.prompt, durationMs: answer.durationMs });
@@ -228,19 +231,45 @@ module.exports = {
       let slackHeader = null;
 
       if (slackContext) {
-        const { channel, thread_ts, sender_name } = slackContext;
+        let { channel, thread_ts, sender_name } = slackContext;
         slackUser = sender_name ? await getUserInfo(sender_name) : null;
         displayName = slackUser?.profile?.display_name || slackUser?.real_name || sender_name || 'friend';
+
+        // If no thread_ts provided, find the user's most recent message to thread off
+        if (!thread_ts && slackUser?.id) {
+          thread_ts = await findRecentUserMessage({ channel, userId: slackUser.id });
+        }
+
         const abbrev = rawPrompt.length > 60 ? rawPrompt.slice(0, 60) + '…' : rawPrompt;
         slackHeader = `*${displayName}*: _${abbrev}_`;
         const posted = await sendSlackMessage({ channel, message: `${slackHeader}\nOn it!`, threadTs: thread_ts });
-        statusMsg = { channel: posted.channel, ts: posted.ts };
+        // Keep the original thread_ts so all replies stay in the same thread
+        // (avoid threading off our own status message)
+        statusMsg = { channel: posted.channel, ts: posted.ts, threadTs: thread_ts || posted.ts };
       }
 
       const updateSlackStatus = createStatusUpdater({ statusMsg, header: slackHeader, res });
 
+      // Load prior thread context if we're replying in a thread
+      let threadContext = '';
+      if (statusMsg?.threadTs) {
+        try {
+          const messages = await fetchThreadHistory({
+            channel: statusMsg.channel,
+            threadTs: statusMsg.threadTs,
+          });
+          // Exclude the current message (last one) and any bot status messages
+          const prior = messages.slice(0, -1).filter(m => m.text && !m.text.startsWith('On it'));
+          if (prior.length) {
+            threadContext = prior.map(m => `[thread] ${m.text}`).join('\n') + '\n\n';
+          }
+        } catch (err) {
+          console.error('Failed to fetch thread history:', err.message);
+        }
+      }
+
       // Use Claude to parse the raw prompt into structured parameters
-      let prompt, format, respond_email, replyInline;
+      let prompt, format, respond_email, replyInline, shortPrompt;
       try {
         updateSlackStatus('status', { text: 'Getting my stuff together...' });
         const parsed = await parsePrompt(rawPrompt);
@@ -248,12 +277,14 @@ module.exports = {
         format = parsed.format || 'md';
         respond_email = parsed.respond_email || null;
         replyInline = parsed.reply_inline;
+        shortPrompt = parsed.short_prompt || null;
       } catch (err) {
         console.error('Preprocessing failed, using raw prompt:', err.message);
         prompt = rawPrompt;
         format = 'md';
         respond_email = null;
         replyInline = null;
+        shortPrompt = null;
       }
 
       // Default to HTML body (no attachment) when email is requested without an explicit format
@@ -285,9 +316,12 @@ module.exports = {
         updateSlackStatus('start', { prompt });
       }
 
+      // Prepend thread context so Claude has prior conversation history
+      const fullPrompt = threadContext ? `Prior conversation in this thread:\n${threadContext}Current question:\n${prompt}` : prompt;
+
       let answer;
       try {
-        const result = await claudeStream(prompt, {
+        const result = await claudeStream(fullPrompt, {
           cwd: MOBE_DIR,
           systemPrompt: SYSTEM_PROMPT,
           timeoutMs,
@@ -306,7 +340,7 @@ module.exports = {
         running--;
       }
 
-      await sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_email, format, prompt, slackUser });
+      await sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_email, format, prompt, slackUser, shortPrompt });
     } catch (err) {
       res.status(500).json({ error: err.message, stack: err.stack });
     }
