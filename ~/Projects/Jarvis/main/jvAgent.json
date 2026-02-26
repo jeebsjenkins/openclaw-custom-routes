@@ -1,0 +1,6 @@
+{
+  "name": "main",
+  "description": "Main agent",
+  "workDirs": [],
+  "defaultModel": null
+}

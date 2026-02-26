@@ -15,6 +15,7 @@ const config = {
   fastmailAppPassword: process.env.FASTMAIL_APP_PASSWORD,
   claudeSocketPort: parseInt(process.env.CLAUDE_SOCKET_PORT, 10) || 3101,
   claudeSocketToken: process.env.CLAUDE_SOCKET_TOKEN,
+  projectRoot: process.env.PROJECT_ROOT || path.join(require('os').homedir(), '.claude-projects'),
 };
 
 module.exports = config;

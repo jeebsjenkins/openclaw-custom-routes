@@ -4,7 +4,8 @@ const config = require('../config');
 const RouteLoader = require('./loader');
 const gateway = require('./gateway');
 const claudeSocket = require('./claudeSocket');
-const { claudeStream } = require('./claudeHelper');
+const { claudeStream, createAgentCLIPool } = require('./claudeHelper');
+const { createProjectManager } = require('./projectManager');
 
 // Simple structured logger
 const log = {
@@ -93,11 +94,16 @@ async function start() {
   // Start Claude WebSocket server (non-blocking — warn on failure, don't crash)
   if (config.claudeSocketToken) {
     try {
+      const projectManager = createProjectManager(config.projectRoot);
+      const agentCLIPool = createAgentCLIPool({ projectManager, log });
+      log.info(`Project root: ${config.projectRoot}`);
       claudeSocket.start({
         port: config.claudeSocketPort,
         host: config.host,
         token: config.claudeSocketToken,
         claudeStreamFn: claudeStream,
+        projectManager,
+        agentCLIPool,
         log,
       });
     } catch (err) {

@@ -1,9 +1,8 @@
 const axios = require('axios');
 
-const WEBHOOK_SECRET = '66d03b8c894f5f5acaaf4bd799ddb944a1ae8356b65c5cc20223b6ac1c855108';
+const WEBHOOK_SECRETS = (process.env.TELEGRAM_WEBHOOK_SECRETS || '').split(',').map(s => s.trim()).filter(Boolean);
 const OPENCLAW_WEBHOOK_URL = 'http://127.0.0.1:8787/telegram-webhook';
 const OPENCLAW_INJECT_URL = 'http://127.0.0.1:18789/inject/telegram';
-
 
 function log(level, message, data = {}) {
   const timestamp = new Date().toISOString();
@@ -16,15 +15,17 @@ function log(level, message, data = {}) {
 }
 
 module.exports = {
-  path: '/telegram-webhook',
+  path: '/telegram-webhook{/:channel}',
   method: 'POST',
   description: 'Receive Telegram webhooks and forward to OpenClaw gateway',
   handler: async (req, res) => {
     const startTime = Date.now();
     const updateId = req.body?.update_id || 'unknown';
-    
+    const channel = req.params.channel || null;
+
     log('info', `Incoming webhook request`, {
       updateId,
+      channel,
       ip: req.ip || req.headers['x-forwarded-for'] || req.connection?.remoteAddress,
       userAgent: req.headers['user-agent'],
       hasSecret: !!req.headers['x-telegram-bot-api-secret-token'],
@@ -35,11 +36,11 @@ module.exports = {
       // Verify Telegram secret token
       const receivedSecret = req.headers['x-telegram-bot-api-secret-token'];
       
-      if (receivedSecret !== WEBHOOK_SECRET) {
+      if (!receivedSecret || !WEBHOOK_SECRETS.includes(receivedSecret)) {
         log('warn', `Unauthorized: Invalid or missing secret token`, {
           updateId,
           receivedSecretLength: receivedSecret?.length || 0,
-          expectedSecretLength: WEBHOOK_SECRET.length
+          configuredSecrets: WEBHOOK_SECRETS.length
         });
         return res.status(401).json({ error: 'Unauthorized' });
       }
@@ -74,15 +75,16 @@ module.exports = {
       }
 
       // Forward to OpenClaw's Telegram webhook listener (handles session routing)
-      log('debug', `Forwarding to OpenClaw`, { url: OPENCLAW_WEBHOOK_URL });
-      
+      const forwardUrl = channel ? `${OPENCLAW_WEBHOOK_URL}/${channel}` : OPENCLAW_WEBHOOK_URL;
+      log('debug', `Forwarding to OpenClaw`, { url: forwardUrl });
+
       const response = await axios.post(
-        OPENCLAW_WEBHOOK_URL,
+        forwardUrl,
         req.body,
         {
           headers: {
             'Content-Type': 'application/json',
-            'X-Telegram-Bot-Api-Secret-Token': WEBHOOK_SECRET
+            'X-Telegram-Bot-Api-Secret-Token': receivedSecret
           },
           timeout: 10000,
           validateStatus: () => true // Don't throw on non-2xx

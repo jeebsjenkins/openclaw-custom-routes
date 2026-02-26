@@ -1,0 +1,6 @@
+{
+  "name": "main",
+  "description": "Manages projects and other agents",
+  "workDirs": [],
+  "defaultModel": null
+}

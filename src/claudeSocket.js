@@ -59,6 +59,7 @@ const HEARTBEAT_INTERVAL_MS = 30000;
  * @param {string}   opts.token           - Shared secret for auth
  * @param {function} opts.claudeStreamFn  - (prompt, options, onEvent) => Promise
  * @param {object}   [opts.projectManager] - ProjectManager instance (optional, enables project commands)
+ * @param {object}   [opts.agentCLIPool]  - AgentCLIPool instance (optional, enables cached agent CLI resolution)
  * @param {object}   [opts.log]           - Logger with info/warn/error methods
  * @returns {{ wss: WebSocketServer, close: () => void }}
  */
@@ -69,6 +70,7 @@ function start(opts = {}) {
     token,
     claudeStreamFn,
     projectManager,
+    agentCLIPool,
     log = console,
   } = opts;
 
@@ -90,8 +92,8 @@ function start(opts = {}) {
   });
 
   // Session handlers
-  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, log));
-  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, log));
+  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
+  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
   registerHandler('session.abort', (ws, msg) => handleSessionAbort(ws, msg, log));
 
   // Session list
@@ -286,7 +288,31 @@ function start(opts = {}) {
 
 // ─── Session handlers ─────────────────────────────────────────────────────────
 
-function handleSessionStart(ws, msg, claudeStreamFn, projectManager, log) {
+/**
+ * Resolve CLI options for a project — uses the agentCLIPool if available,
+ * otherwise falls back to reading project config directly.
+ */
+function _resolveProjectOptions(project, options, projectManager, agentCLIPool) {
+  if (!project || !projectManager) return { ...options };
+
+  if (agentCLIPool) {
+    const agent = agentCLIPool.getAgentCLI(project);
+    return { ...agent.options, ...options };
+  }
+
+  // Fallback: resolve directly
+  const proj = projectManager.getProject(project);
+  const cliOptions = { ...options, cwd: proj.path };
+  if (proj.workDirs && proj.workDirs.length > 0) {
+    cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...proj.workDirs];
+  }
+  if (proj.defaultModel && !cliOptions.model) {
+    cliOptions.model = proj.defaultModel;
+  }
+  return cliOptions;
+}
+
+function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log) {
   const sessionId = msg.id || crypto.randomUUID();
   const { prompt, project, options = {} } = msg;
 
@@ -295,22 +321,12 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, log) {
     return;
   }
 
-  // Resolve project context if available
-  let cliOptions = { ...options };
-  if (project && projectManager) {
-    try {
-      const proj = projectManager.getProject(project);
-      cliOptions.cwd = proj.path;
-      if (proj.workDirs && proj.workDirs.length > 0) {
-        cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...proj.workDirs];
-      }
-      if (proj.defaultModel && !cliOptions.model) {
-        cliOptions.model = proj.defaultModel;
-      }
-    } catch (err) {
-      reply(ws, msg, { type: 'session.error', sessionId, error: `Project error: ${err.message}` });
-      return;
-    }
+  let cliOptions;
+  try {
+    cliOptions = _resolveProjectOptions(project, options, projectManager, agentCLIPool);
+  } catch (err) {
+    reply(ws, msg, { type: 'session.error', sessionId, error: `Project error: ${err.message}` });
+    return;
   }
 
   // Assign a CLI session ID so we can resume later
@@ -319,7 +335,7 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, log) {
   _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, project, log);
 }
 
-function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, log) {
+function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log) {
   const { sessionId, prompt, project, options = {} } = msg;
 
   if (!sessionId) {
@@ -331,21 +347,12 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, log) {
     return;
   }
 
-  let cliOptions = { ...options };
-  if (project && projectManager) {
-    try {
-      const proj = projectManager.getProject(project);
-      cliOptions.cwd = proj.path;
-      if (proj.workDirs && proj.workDirs.length > 0) {
-        cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...proj.workDirs];
-      }
-      if (proj.defaultModel && !cliOptions.model) {
-        cliOptions.model = proj.defaultModel;
-      }
-    } catch (err) {
-      reply(ws, msg, { type: 'session.error', sessionId, error: `Project error: ${err.message}` });
-      return;
-    }
+  let cliOptions;
+  try {
+    cliOptions = _resolveProjectOptions(project, options, projectManager, agentCLIPool);
+  } catch (err) {
+    reply(ws, msg, { type: 'session.error', sessionId, error: `Project error: ${err.message}` });
+    return;
   }
 
   // Use --resume to continue the conversation
