@@ -9,6 +9,7 @@ const { createProjectManager } = require('./projectManager');
 const { createToolLoader } = require('./toolLoader');
 const { createMessageBus } = require('./messageBus');
 const { createLogScanner } = require('./logScanner');
+const { createCommsRouter } = require('./commsRouter');
 
 // Simple structured logger
 const log = {
@@ -102,6 +103,7 @@ async function start() {
       const toolLoader = createToolLoader(config.projectRoot, log);
       const messageBus = createMessageBus(config.projectRoot, log);
       const logScanner = createLogScanner(config.projectRoot, projectManager.listAgents, log);
+      const commsRouter = createCommsRouter(config.projectRoot, messageBus, projectManager, log);
       log.info(`Project root: ${config.projectRoot}`);
       claudeSocket.start({
         port: config.claudeSocketPort,
@@ -113,6 +115,7 @@ async function start() {
         toolLoader,
         messageBus,
         logScanner,
+        commsRouter,
         log,
       });
     } catch (err) {

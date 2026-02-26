@@ -52,6 +52,13 @@
  *   { type: "logs.search", options }
  *   { type: "logs.conversations", agentPrefix? }
  *
+ * ── Communications Router ──────────────────────────────────────────
+ *   { type: "comms.subscribe", agentId, pattern }
+ *   { type: "comms.unsubscribe", agentId, pattern }
+ *   { type: "comms.subscriptions", agentId }
+ *   { type: "comms.inbound", path, externalId?, source, payload }
+ *   { type: "comms.unmatched", options? }
+ *
  * ── Keepalive ────────────────────────────────────────────────────────
  *   { type: "ping" }  →  { type: "pong" }
  */
@@ -75,6 +82,7 @@ const HEARTBEAT_INTERVAL_MS = 30000;
  * @param {object}   [opts.messageBus]    - MessageBus instance
  * @param {object}   [opts.logScanner]    - LogScanner instance
  * @param {object}   [opts.agentCLIPool]  - AgentCLIPool instance
+ * @param {object}   [opts.commsRouter]   - CommsRouter instance
  * @param {object}   [opts.log]           - Logger with info/warn/error methods
  * @returns {{ wss: WebSocketServer, close: () => void }}
  */
@@ -89,6 +97,7 @@ function start(opts = {}) {
     messageBus,
     logScanner,
     agentCLIPool,
+    commsRouter,
     log = console,
   } = opts;
 
@@ -223,7 +232,7 @@ function start(opts = {}) {
     });
 
     registerHandler('agent.tool.execute', (ws, msg) => {
-      const context = { messageBus, logScanner };
+      const context = { messageBus, logScanner, commsRouter };
       toolLoader.executeTool(msg.agentId, msg.toolName, msg.input || {}, context)
         .then(result => {
           reply(ws, msg, { type: 'agent.tool.result', agentId: msg.agentId, toolName: msg.toolName, result });
@@ -314,6 +323,62 @@ function start(opts = {}) {
         reply(ws, msg, { type: 'logs.conversations.result', conversations });
       } catch (err) {
         reply(ws, msg, { type: 'logs.conversations.error', error: err.message });
+      }
+    });
+  }
+
+  // ─── Communications router handlers ───────────────────────────────────────
+
+  if (commsRouter) {
+    registerHandler('comms.subscribe', (ws, msg) => {
+      try {
+        const result = commsRouter.subscribe(msg.agentId, msg.pattern);
+        const subscriptions = commsRouter.getSubscriptions(msg.agentId);
+        reply(ws, msg, { type: 'comms.subscribe.ok', agentId: msg.agentId, pattern: result.pattern, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'comms.subscribe.error', agentId: msg.agentId, error: err.message });
+      }
+    });
+
+    registerHandler('comms.unsubscribe', (ws, msg) => {
+      try {
+        const result = commsRouter.unsubscribe(msg.agentId, msg.pattern);
+        const subscriptions = commsRouter.getSubscriptions(msg.agentId);
+        reply(ws, msg, { type: 'comms.unsubscribe.ok', agentId: msg.agentId, pattern: result.pattern, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'comms.unsubscribe.error', agentId: msg.agentId, error: err.message });
+      }
+    });
+
+    registerHandler('comms.subscriptions', (ws, msg) => {
+      try {
+        const subscriptions = commsRouter.getSubscriptions(msg.agentId);
+        reply(ws, msg, { type: 'comms.subscriptions.result', agentId: msg.agentId, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'comms.subscriptions.error', agentId: msg.agentId, error: err.message });
+      }
+    });
+
+    registerHandler('comms.inbound', (ws, msg) => {
+      try {
+        const result = commsRouter.route({
+          path: msg.path,
+          externalId: msg.externalId,
+          source: msg.source,
+          payload: msg.payload || {},
+        });
+        reply(ws, msg, { type: 'comms.inbound.ok', ...result });
+      } catch (err) {
+        reply(ws, msg, { type: 'comms.inbound.error', error: err.message });
+      }
+    });
+
+    registerHandler('comms.unmatched', (ws, msg) => {
+      try {
+        const messages = commsRouter.getUnmatched(msg.options || {});
+        reply(ws, msg, { type: 'comms.unmatched.result', messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'comms.unmatched.error', error: err.message });
       }
     });
   }

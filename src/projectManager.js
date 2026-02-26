@@ -126,6 +126,7 @@ function createProjectManager(projectRoot) {
       defaultModel: config.defaultModel || null,
       hasClaudeMd: fs.existsSync(path.join(agentPath, 'CLAUDE.md')),
       hasTools: fs.existsSync(path.join(agentPath, 'tools')),
+      commsSubscriptions: config.commsSubscriptions || [],
       sessions,
     };
   }
