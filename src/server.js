@@ -6,6 +6,9 @@ const gateway = require('./gateway');
 const claudeSocket = require('./claudeSocket');
 const { claudeStream, createAgentCLIPool } = require('./claudeHelper');
 const { createProjectManager } = require('./projectManager');
+const { createToolLoader } = require('./toolLoader');
+const { createMessageBus } = require('./messageBus');
+const { createLogScanner } = require('./logScanner');
 
 // Simple structured logger
 const log = {
@@ -96,6 +99,9 @@ async function start() {
     try {
       const projectManager = createProjectManager(config.projectRoot);
       const agentCLIPool = createAgentCLIPool({ projectManager, log });
+      const toolLoader = createToolLoader(config.projectRoot, log);
+      const messageBus = createMessageBus(config.projectRoot, log);
+      const logScanner = createLogScanner(config.projectRoot, projectManager.listAgents, log);
       log.info(`Project root: ${config.projectRoot}`);
       claudeSocket.start({
         port: config.claudeSocketPort,
@@ -104,6 +110,9 @@ async function start() {
         claudeStreamFn: claudeStream,
         projectManager,
         agentCLIPool,
+        toolLoader,
+        messageBus,
+        logScanner,
         log,
       });
     } catch (err) {

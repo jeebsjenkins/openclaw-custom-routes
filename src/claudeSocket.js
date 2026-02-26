@@ -17,28 +17,40 @@
  *   { type: "auth.ok" }
  *   { type: "auth.error", error }
  *
- * ── Projects ─────────────────────────────────────────────────────────
+ * ── Agents ────────────────────────────────────────────────────────────
  * Client → Server:
- *   { type: "project.list" }
- *   { type: "project.get", name }
- *   { type: "project.create", name, config? }
- *   { type: "project.update", name, config }
- *   { type: "project.claudemd.get", name }
- *   { type: "project.claudemd.set", name, content }
+ *   { type: "agent.list" }
+ *   { type: "agent.get", id }
+ *   { type: "agent.create", id, config? }
+ *   { type: "agent.update", id, config }
+ *   { type: "agent.delete", id }
+ *   { type: "agent.claudemd.get", id }
+ *   { type: "agent.claudemd.set", id, content }
+ *
+ * ── Agent Tools ───────────────────────────────────────────────────────
+ *   { type: "agent.tools.list", agentId }
+ *   { type: "agent.tools.refresh", agentId? }
+ *   { type: "agent.tool.execute", agentId, toolName, input }
+ *
+ * ── Agent Messaging ──────────────────────────────────────────────────
+ *   { type: "agent.send", from, to, command, payload }
+ *   { type: "agent.messages", agentId }
+ *   { type: "agent.subscribe", agentId }
+ *   { type: "agent.broadcast", from, command, payload }
  *
  * ── Sessions ─────────────────────────────────────────────────────────
  * Client → Server:
- *   { type: "session.list", project }
- *   { type: "session.start", id?, project, prompt, options? }
- *   { type: "session.continue", project, sessionId, prompt, options? }
+ *   { type: "session.list", agent }
+ *   { type: "session.start", id?, agent, prompt, options? }
+ *   { type: "session.continue", agent, sessionId, prompt, options? }
  *   { type: "session.abort", sessionId }
  *
- * Server → Client (streaming):
- *   { type: "session.thinking", sessionId, text }
- *   { type: "session.text", sessionId, text }
- *   { type: "session.result", sessionId, text, durationMs }
- *   { type: "session.error", sessionId, error }
- *   { type: "session.event", sessionId, data }
+ * ── Conversation History ─────────────────────────────────────────────
+ *   { type: "conversation.history", agent, sessionId }
+ *
+ * ── Log Search ───────────────────────────────────────────────────────
+ *   { type: "logs.search", options }
+ *   { type: "logs.conversations", agentPrefix? }
  *
  * ── Keepalive ────────────────────────────────────────────────────────
  *   { type: "ping" }  →  { type: "pong" }
@@ -58,8 +70,11 @@ const HEARTBEAT_INTERVAL_MS = 30000;
  * @param {string}   [opts.host]          - Bind address (default 0.0.0.0)
  * @param {string}   opts.token           - Shared secret for auth
  * @param {function} opts.claudeStreamFn  - (prompt, options, onEvent) => Promise
- * @param {object}   [opts.projectManager] - ProjectManager instance (optional, enables project commands)
- * @param {object}   [opts.agentCLIPool]  - AgentCLIPool instance (optional, enables cached agent CLI resolution)
+ * @param {object}   [opts.projectManager] - ProjectManager instance
+ * @param {object}   [opts.toolLoader]    - ToolLoader instance
+ * @param {object}   [opts.messageBus]    - MessageBus instance
+ * @param {object}   [opts.logScanner]    - LogScanner instance
+ * @param {object}   [opts.agentCLIPool]  - AgentCLIPool instance
  * @param {object}   [opts.log]           - Logger with info/warn/error methods
  * @returns {{ wss: WebSocketServer, close: () => void }}
  */
@@ -70,6 +85,9 @@ function start(opts = {}) {
     token,
     claudeStreamFn,
     projectManager,
+    toolLoader,
+    messageBus,
+    logScanner,
     agentCLIPool,
     log = console,
   } = opts;
@@ -91,94 +109,211 @@ function start(opts = {}) {
     reply(ws, msg, { type: 'pong' });
   });
 
-  // Session handlers
-  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
-  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
-  registerHandler('session.abort', (ws, msg) => handleSessionAbort(ws, msg, log));
+  // ─── Agent handlers ─────────────────────────────────────────────────────
 
-  // Session list
   if (projectManager) {
+    registerHandler('agent.list', (ws, msg) => {
+      try {
+        const agents = projectManager.listAgents();
+        reply(ws, msg, { type: 'agent.list.result', agents });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.list.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.get', (ws, msg) => {
+      try {
+        const agent = projectManager.getAgent(msg.id);
+        reply(ws, msg, { type: 'agent.get.result', agent });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.get.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.create', (ws, msg) => {
+      try {
+        const result = projectManager.createAgent(msg.id, msg.config || {});
+        reply(ws, msg, { type: 'agent.create.ok', id: msg.id, agent: result });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.create.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.update', (ws, msg) => {
+      try {
+        const result = projectManager.updateAgent(msg.id, msg.config || {});
+        reply(ws, msg, { type: 'agent.update.ok', id: msg.id, agent: result });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.update.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.delete', (ws, msg) => {
+      try {
+        projectManager.deleteAgent(msg.id);
+        reply(ws, msg, { type: 'agent.delete.ok', id: msg.id });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.delete.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.claudemd.get', (ws, msg) => {
+      try {
+        const content = projectManager.getClaudeMd(msg.id);
+        reply(ws, msg, { type: 'agent.claudemd.result', id: msg.id, content });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.claudemd.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.claudemd.set', (ws, msg) => {
+      try {
+        projectManager.updateClaudeMd(msg.id, msg.content);
+        reply(ws, msg, { type: 'agent.claudemd.ok', id: msg.id });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.claudemd.error', error: err.message });
+      }
+    });
+
+    // ─── Session handlers ───────────────────────────────────────────────
+
     registerHandler('session.list', (ws, msg) => {
       try {
-        const sessions = projectManager.listSessions(msg.project);
+        const sessions = projectManager.listSessions(msg.agent);
         reply(ws, msg, { type: 'session.list.result', sessions });
       } catch (err) {
         reply(ws, msg, { type: 'session.list.error', error: err.message });
       }
     });
-  }
-
-  // Project handlers (only if projectManager is provided)
-  if (projectManager) {
-    registerHandler('project.list', (ws, msg) => {
-      try {
-        const projects = projectManager.listProjects();
-        reply(ws, msg, { type: 'project.list.result', projects });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.list.error', error: err.message });
-      }
-    });
-
-    registerHandler('project.get', (ws, msg) => {
-      try {
-        const project = projectManager.getProject(msg.name);
-        reply(ws, msg, { type: 'project.get.result', project });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.get.error', error: err.message });
-      }
-    });
-
-    registerHandler('project.create', (ws, msg) => {
-      try {
-        const result = projectManager.createProject(msg.name, msg.config || {});
-        reply(ws, msg, { type: 'project.create.ok', name: msg.name, project: result });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.create.error', error: err.message });
-      }
-    });
-
-    registerHandler('project.delete', (ws, msg) => {
-      try {
-        projectManager.deleteProject(msg.name);
-        reply(ws, msg, { type: 'project.delete.ok', name: msg.name });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.delete.error', error: err.message });
-      }
-    });
-
-    registerHandler('project.update', (ws, msg) => {
-      try {
-        const result = projectManager.updateProject(msg.name, msg.config || {});
-        reply(ws, msg, { type: 'project.update.ok', name: msg.name, project: result });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.update.error', error: err.message });
-      }
-    });
-
-    registerHandler('project.claudemd.get', (ws, msg) => {
-      try {
-        const content = projectManager.getClaudeMd(msg.name);
-        reply(ws, msg, { type: 'project.claudemd.result', name: msg.name, content });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.claudemd.error', error: err.message });
-      }
-    });
-
-    registerHandler('project.claudemd.set', (ws, msg) => {
-      try {
-        projectManager.updateClaudeMd(msg.name, msg.content);
-        reply(ws, msg, { type: 'project.claudemd.ok', name: msg.name });
-      } catch (err) {
-        reply(ws, msg, { type: 'project.claudemd.error', error: err.message });
-      }
-    });
 
     registerHandler('conversation.history', (ws, msg) => {
       try {
-        const entries = projectManager.getConversationLog(msg.project, msg.sessionId);
-        reply(ws, msg, { type: 'conversation.history.result', project: msg.project, sessionId: msg.sessionId, entries });
+        const entries = projectManager.getConversationLog(msg.agent, msg.sessionId);
+        reply(ws, msg, { type: 'conversation.history.result', agent: msg.agent, sessionId: msg.sessionId, entries });
       } catch (err) {
         reply(ws, msg, { type: 'conversation.history.error', error: err.message });
+      }
+    });
+  }
+
+  // Session start/continue/abort always registered
+  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
+  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
+  registerHandler('session.abort', (ws, msg) => handleSessionAbort(ws, msg, log));
+
+  // ─── Tool handlers ──────────────────────────────────────────────────────
+
+  if (toolLoader) {
+    registerHandler('agent.tools.list', (ws, msg) => {
+      try {
+        const tools = toolLoader.listAgentTools(msg.agentId);
+        reply(ws, msg, { type: 'agent.tools.list.result', agentId: msg.agentId, tools });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.tools.list.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.tools.refresh', (ws, msg) => {
+      try {
+        toolLoader.refresh(msg.agentId);
+        reply(ws, msg, { type: 'agent.tools.refresh.ok' });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.tools.refresh.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.tool.execute', (ws, msg) => {
+      const context = { messageBus, logScanner };
+      toolLoader.executeTool(msg.agentId, msg.toolName, msg.input || {}, context)
+        .then(result => {
+          reply(ws, msg, { type: 'agent.tool.result', agentId: msg.agentId, toolName: msg.toolName, result });
+        })
+        .catch(err => {
+          reply(ws, msg, { type: 'agent.tool.error', error: err.message });
+        });
+    });
+  }
+
+  // ─── Message bus handlers ───────────────────────────────────────────────
+
+  if (messageBus) {
+    registerHandler('agent.send', (ws, msg) => {
+      try {
+        const result = messageBus.send(msg.from, msg.to, {
+          command: msg.command,
+          payload: msg.payload,
+        });
+        reply(ws, msg, { type: 'agent.send.ok', messageId: result.id });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.send.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.messages', (ws, msg) => {
+      try {
+        const messages = messageBus.receive(msg.agentId);
+        reply(ws, msg, { type: 'agent.messages.result', agentId: msg.agentId, messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.messages.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.subscribe', (ws, msg) => {
+      try {
+        const unsubscribe = messageBus.subscribe(msg.agentId, (message) => {
+          sendJSON(ws, { type: 'agent.message', message });
+        });
+
+        // Store unsubscribe for cleanup on disconnect
+        if (!ws._csSubscriptions) ws._csSubscriptions = [];
+        ws._csSubscriptions.push(unsubscribe);
+
+        reply(ws, msg, { type: 'agent.subscribe.ok', agentId: msg.agentId });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.subscribe.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.broadcast', (ws, msg) => {
+      try {
+        const result = messageBus.broadcast(msg.from, {
+          command: msg.command,
+          payload: msg.payload,
+        });
+        reply(ws, msg, { type: 'agent.broadcast.ok', messageId: result.id });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.broadcast.error', error: err.message });
+      }
+    });
+
+    registerHandler('agent.messages.history', (ws, msg) => {
+      try {
+        const messages = messageBus.history(msg.agentId, msg.options || {});
+        reply(ws, msg, { type: 'agent.messages.history.result', agentId: msg.agentId, messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'agent.messages.history.error', error: err.message });
+      }
+    });
+  }
+
+  // ─── Log search handlers ────────────────────────────────────────────────
+
+  if (logScanner) {
+    registerHandler('logs.search', (ws, msg) => {
+      try {
+        const results = logScanner.search(msg.options || {});
+        reply(ws, msg, { type: 'logs.search.result', results });
+      } catch (err) {
+        reply(ws, msg, { type: 'logs.search.error', error: err.message });
+      }
+    });
+
+    registerHandler('logs.conversations', (ws, msg) => {
+      try {
+        const conversations = logScanner.listConversations(msg.agentPrefix);
+        reply(ws, msg, { type: 'logs.conversations.result', conversations });
+      } catch (err) {
+        reply(ws, msg, { type: 'logs.conversations.error', error: err.message });
       }
     });
   }
@@ -204,6 +339,7 @@ function start(opts = {}) {
     ws._csAlive = true;
     ws._csAuthed = false;
     ws._csSessions = new Map();
+    ws._csSubscriptions = [];
 
     ws.on('pong', () => { ws._csAlive = true; });
 
@@ -257,11 +393,20 @@ function start(opts = {}) {
 
     ws.on('close', () => {
       clearTimeout(authTimer);
+
+      // Abort all active sessions
       for (const [sid, session] of ws._csSessions) {
         log.info(`[claudeSocket] Aborting session ${sid} (client disconnected)`);
         if (session.abort) session.abort();
       }
       ws._csSessions.clear();
+
+      // Clean up message bus subscriptions
+      for (const unsub of ws._csSubscriptions) {
+        try { unsub(); } catch { /* ignore */ }
+      }
+      ws._csSubscriptions = [];
+
       log.info(`[claudeSocket] Client ${clientAddr} disconnected`);
     });
 
@@ -289,32 +434,32 @@ function start(opts = {}) {
 // ─── Session handlers ─────────────────────────────────────────────────────────
 
 /**
- * Resolve CLI options for a project — uses the agentCLIPool if available,
- * otherwise falls back to reading project config directly.
+ * Resolve CLI options for an agent — uses the agentCLIPool if available,
+ * otherwise falls back to reading agent config directly.
  */
-function _resolveProjectOptions(project, options, projectManager, agentCLIPool) {
-  if (!project || !projectManager) return { ...options };
+function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool) {
+  if (!agentId || !projectManager) return { ...options };
 
   if (agentCLIPool) {
-    const agent = agentCLIPool.getAgentCLI(project);
+    const agent = agentCLIPool.getAgentCLI(agentId);
     return { ...agent.options, ...options };
   }
 
   // Fallback: resolve directly
-  const proj = projectManager.getProject(project);
-  const cliOptions = { ...options, cwd: proj.path };
-  if (proj.workDirs && proj.workDirs.length > 0) {
-    cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...proj.workDirs];
+  const agent = projectManager.getAgent(agentId);
+  const cliOptions = { ...options, cwd: agent.path };
+  if (agent.workDirs && agent.workDirs.length > 0) {
+    cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...agent.workDirs];
   }
-  if (proj.defaultModel && !cliOptions.model) {
-    cliOptions.model = proj.defaultModel;
+  if (agent.defaultModel && !cliOptions.model) {
+    cliOptions.model = agent.defaultModel;
   }
   return cliOptions;
 }
 
 function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log) {
   const sessionId = msg.id || crypto.randomUUID();
-  const { prompt, project, options = {} } = msg;
+  const { prompt, agent, options = {} } = msg;
 
   if (!prompt) {
     reply(ws, msg, { type: 'session.error', sessionId, error: 'prompt is required' });
@@ -323,20 +468,20 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPoo
 
   let cliOptions;
   try {
-    cliOptions = _resolveProjectOptions(project, options, projectManager, agentCLIPool);
+    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool);
   } catch (err) {
-    reply(ws, msg, { type: 'session.error', sessionId, error: `Project error: ${err.message}` });
+    reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
   }
 
   // Assign a CLI session ID so we can resume later
   cliOptions.sessionId = sessionId;
 
-  _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, project, log);
+  _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agent, log);
 }
 
 function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log) {
-  const { sessionId, prompt, project, options = {} } = msg;
+  const { sessionId, prompt, agent, options = {} } = msg;
 
   if (!sessionId) {
     reply(ws, msg, { type: 'session.error', error: 'sessionId is required' });
@@ -349,19 +494,19 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
 
   let cliOptions;
   try {
-    cliOptions = _resolveProjectOptions(project, options, projectManager, agentCLIPool);
+    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool);
   } catch (err) {
-    reply(ws, msg, { type: 'session.error', sessionId, error: `Project error: ${err.message}` });
+    reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
   }
 
   // Use --resume to continue the conversation
   cliOptions.resumeSessionId = sessionId;
 
-  _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, project, log);
+  _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agent, log);
 }
 
-function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, project, log) {
+function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agentId, log) {
   if (ws._csSessions.has(sessionId)) {
     reply(ws, msg, { type: 'session.error', sessionId, error: 'Session ID already active' });
     return;
@@ -373,9 +518,9 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
   log.info(`[claudeSocket] Starting session ${sessionId}: "${prompt.slice(0, 80)}..."`);
 
   // Log user prompt to conversation log
-  if (project && projectManager) {
+  if (agentId && projectManager) {
     try {
-      projectManager.appendConversationLog(project, sessionId, {
+      projectManager.appendConversationLog(agentId, sessionId, {
         role: 'user',
         type: 'prompt',
         text: prompt,
@@ -418,16 +563,16 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
   claudeStreamFn(prompt, cliOptions, onEvent)
     .then(({ markdown, durationMs }) => {
       // Save session metadata + conversation log
-      if (project && projectManager) {
+      if (agentId && projectManager) {
         try {
-          projectManager.saveSession(project, sessionId, {
+          projectManager.saveSession(agentId, sessionId, {
             title: prompt.slice(0, 100),
             createdAt: Date.now() - durationMs,
             durationMs,
           });
         } catch { /* non-fatal */ }
         try {
-          projectManager.appendConversationLog(project, sessionId, {
+          projectManager.appendConversationLog(agentId, sessionId, {
             role: 'assistant',
             type: 'result',
             text: markdown,
@@ -441,9 +586,9 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
     })
     .catch((err) => {
       // Log errors to conversation log
-      if (project && projectManager) {
+      if (agentId && projectManager) {
         try {
-          projectManager.appendConversationLog(project, sessionId, {
+          projectManager.appendConversationLog(agentId, sessionId, {
             role: 'system',
             type: 'error',
             text: err.message,
