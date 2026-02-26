@@ -32,11 +32,18 @@
  *   { type: "agent.tools.refresh", agentId? }
  *   { type: "agent.tool.execute", agentId, toolName, input }
  *
- * ── Agent Messaging ──────────────────────────────────────────────────
- *   { type: "agent.send", from, to, command, payload }
- *   { type: "agent.messages", agentId }
- *   { type: "agent.subscribe", agentId }
- *   { type: "agent.broadcast", from, command, payload }
+ * ── Unified Messaging (msg.*) ────────────────────────────────────────
+ *   { type: "msg.send", from, to, command, payload }
+ *   { type: "msg.route", from, path, source, externalId?, command?, payload }
+ *   { type: "msg.broadcast", from, command, payload }
+ *   { type: "msg.receive", agentId }
+ *   { type: "msg.listen", agentId }
+ *   { type: "msg.history", agentId, options? }
+ *   { type: "msg.sub.add", agentId, pattern }
+ *   { type: "msg.sub.remove", agentId, pattern }
+ *   { type: "msg.sub.list", agentId }
+ *   { type: "msg.unmatched", options? }
+ *   { type: "msg.unmatched.clear" }
  *
  * ── Sessions ─────────────────────────────────────────────────────────
  * Client → Server:
@@ -51,13 +58,6 @@
  * ── Log Search ───────────────────────────────────────────────────────
  *   { type: "logs.search", options }
  *   { type: "logs.conversations", agentPrefix? }
- *
- * ── Communications Router ──────────────────────────────────────────
- *   { type: "comms.subscribe", agentId, pattern }
- *   { type: "comms.unsubscribe", agentId, pattern }
- *   { type: "comms.subscriptions", agentId }
- *   { type: "comms.inbound", path, externalId?, source, payload }
- *   { type: "comms.unmatched", options? }
  *
  * ── Keepalive ────────────────────────────────────────────────────────
  *   { type: "ping" }  →  { type: "pong" }
@@ -79,10 +79,9 @@ const HEARTBEAT_INTERVAL_MS = 30000;
  * @param {function} opts.claudeStreamFn  - (prompt, options, onEvent) => Promise
  * @param {object}   [opts.projectManager] - ProjectManager instance
  * @param {object}   [opts.toolLoader]    - ToolLoader instance
- * @param {object}   [opts.messageBus]    - MessageBus instance
+ * @param {object}   [opts.messageBroker] - MessageBroker instance (unified messaging)
  * @param {object}   [opts.logScanner]    - LogScanner instance
  * @param {object}   [opts.agentCLIPool]  - AgentCLIPool instance
- * @param {object}   [opts.commsRouter]   - CommsRouter instance
  * @param {object}   [opts.log]           - Logger with info/warn/error methods
  * @returns {{ wss: WebSocketServer, close: () => void }}
  */
@@ -94,10 +93,9 @@ function start(opts = {}) {
     claudeStreamFn,
     projectManager,
     toolLoader,
-    messageBus,
+    messageBroker,
     logScanner,
     agentCLIPool,
-    commsRouter,
     log = console,
   } = opts;
 
@@ -232,7 +230,7 @@ function start(opts = {}) {
     });
 
     registerHandler('agent.tool.execute', (ws, msg) => {
-      const context = { messageBus, logScanner, commsRouter };
+      const context = { messageBroker, logScanner };
       toolLoader.executeTool(msg.agentId, msg.toolName, msg.input || {}, context)
         .then(result => {
           reply(ws, msg, { type: 'agent.tool.result', agentId: msg.agentId, toolName: msg.toolName, result });
@@ -243,64 +241,124 @@ function start(opts = {}) {
     });
   }
 
-  // ─── Message bus handlers ───────────────────────────────────────────────
+  // ─── Unified message broker handlers (msg.*) ──────────────────────────
 
-  if (messageBus) {
-    registerHandler('agent.send', (ws, msg) => {
+  if (messageBroker) {
+    registerHandler('msg.send', (ws, msg) => {
       try {
-        const result = messageBus.send(msg.from, msg.to, {
+        const result = messageBroker.send(msg.from, msg.to, {
           command: msg.command,
           payload: msg.payload,
         });
-        reply(ws, msg, { type: 'agent.send.ok', messageId: result.id });
+        reply(ws, msg, { type: 'msg.send.ok', messageId: result.id, message: result });
       } catch (err) {
-        reply(ws, msg, { type: 'agent.send.error', error: err.message });
+        reply(ws, msg, { type: 'msg.send.error', error: err.message });
       }
     });
 
-    registerHandler('agent.messages', (ws, msg) => {
+    registerHandler('msg.route', (ws, msg) => {
       try {
-        const messages = messageBus.receive(msg.agentId);
-        reply(ws, msg, { type: 'agent.messages.result', agentId: msg.agentId, messages });
-      } catch (err) {
-        reply(ws, msg, { type: 'agent.messages.error', error: err.message });
-      }
-    });
-
-    registerHandler('agent.subscribe', (ws, msg) => {
-      try {
-        const unsubscribe = messageBus.subscribe(msg.agentId, (message) => {
-          sendJSON(ws, { type: 'agent.message', message });
+        const result = messageBroker.route(msg.from, msg.path, {
+          command: msg.command || 'message',
+          payload: msg.payload || {},
+          source: msg.source || 'external',
+          externalId: msg.externalId,
         });
-
-        // Store unsubscribe for cleanup on disconnect
-        if (!ws._csSubscriptions) ws._csSubscriptions = [];
-        ws._csSubscriptions.push(unsubscribe);
-
-        reply(ws, msg, { type: 'agent.subscribe.ok', agentId: msg.agentId });
+        reply(ws, msg, { type: 'msg.route.ok', ...result });
       } catch (err) {
-        reply(ws, msg, { type: 'agent.subscribe.error', error: err.message });
+        reply(ws, msg, { type: 'msg.route.error', error: err.message });
       }
     });
 
-    registerHandler('agent.broadcast', (ws, msg) => {
+    registerHandler('msg.broadcast', (ws, msg) => {
       try {
-        const result = messageBus.broadcast(msg.from, {
+        const result = messageBroker.broadcast(msg.from, {
           command: msg.command,
           payload: msg.payload,
         });
-        reply(ws, msg, { type: 'agent.broadcast.ok', messageId: result.id });
+        reply(ws, msg, { type: 'msg.broadcast.ok', messageId: result.id, message: result });
       } catch (err) {
-        reply(ws, msg, { type: 'agent.broadcast.error', error: err.message });
+        reply(ws, msg, { type: 'msg.broadcast.error', error: err.message });
       }
     });
 
-    registerHandler('agent.messages.history', (ws, msg) => {
+    registerHandler('msg.receive', (ws, msg) => {
       try {
-        const messages = messageBus.history(msg.agentId, msg.options || {});
-        reply(ws, msg, { type: 'agent.messages.history.result', agentId: msg.agentId, messages });
+        const messages = messageBroker.receive(msg.agentId);
+        reply(ws, msg, { type: 'msg.receive.ok', agentId: msg.agentId, messages });
       } catch (err) {
-        reply(ws, msg, { type: 'agent.messages.history.error', error: err.message });
+        reply(ws, msg, { type: 'msg.receive.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.listen', (ws, msg) => {
+      try {
+        const unsub = messageBroker.listen(msg.agentId, (message) => {
+          sendJSON(ws, { type: 'msg.push', message });
+        });
+
+        if (!ws._mbSubscriptions) ws._mbSubscriptions = [];
+        ws._mbSubscriptions.push(unsub);
+
+        reply(ws, msg, { type: 'msg.listen.ok', agentId: msg.agentId });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.listen.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.history', (ws, msg) => {
+      try {
+        const messages = messageBroker.history(msg.agentId, msg.options || {});
+        reply(ws, msg, { type: 'msg.history.ok', agentId: msg.agentId, messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.history.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.sub.add', (ws, msg) => {
+      try {
+        messageBroker.subscribe(msg.agentId, msg.pattern);
+        const subscriptions = messageBroker.getSubscriptions(msg.agentId);
+        reply(ws, msg, { type: 'msg.sub.add.ok', agentId: msg.agentId, pattern: msg.pattern, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.sub.add.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.sub.remove', (ws, msg) => {
+      try {
+        messageBroker.unsubscribe(msg.agentId, msg.pattern);
+        const subscriptions = messageBroker.getSubscriptions(msg.agentId);
+        reply(ws, msg, { type: 'msg.sub.remove.ok', agentId: msg.agentId, pattern: msg.pattern, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.sub.remove.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.sub.list', (ws, msg) => {
+      try {
+        const subscriptions = messageBroker.getSubscriptions(msg.agentId);
+        reply(ws, msg, { type: 'msg.sub.list.ok', agentId: msg.agentId, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.sub.list.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.unmatched', (ws, msg) => {
+      try {
+        const messages = messageBroker.getUnmatched(msg.options || {});
+        reply(ws, msg, { type: 'msg.unmatched.ok', messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.unmatched.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.unmatched.clear', (ws, msg) => {
+      try {
+        const result = messageBroker.clearUnmatched();
+        reply(ws, msg, { type: 'msg.unmatched.clear.ok', cleared: result.cleared });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.unmatched.clear.error', error: err.message });
       }
     });
   }
@@ -327,62 +385,6 @@ function start(opts = {}) {
     });
   }
 
-  // ─── Communications router handlers ───────────────────────────────────────
-
-  if (commsRouter) {
-    registerHandler('comms.subscribe', (ws, msg) => {
-      try {
-        const result = commsRouter.subscribe(msg.agentId, msg.pattern);
-        const subscriptions = commsRouter.getSubscriptions(msg.agentId);
-        reply(ws, msg, { type: 'comms.subscribe.ok', agentId: msg.agentId, pattern: result.pattern, subscriptions });
-      } catch (err) {
-        reply(ws, msg, { type: 'comms.subscribe.error', agentId: msg.agentId, error: err.message });
-      }
-    });
-
-    registerHandler('comms.unsubscribe', (ws, msg) => {
-      try {
-        const result = commsRouter.unsubscribe(msg.agentId, msg.pattern);
-        const subscriptions = commsRouter.getSubscriptions(msg.agentId);
-        reply(ws, msg, { type: 'comms.unsubscribe.ok', agentId: msg.agentId, pattern: result.pattern, subscriptions });
-      } catch (err) {
-        reply(ws, msg, { type: 'comms.unsubscribe.error', agentId: msg.agentId, error: err.message });
-      }
-    });
-
-    registerHandler('comms.subscriptions', (ws, msg) => {
-      try {
-        const subscriptions = commsRouter.getSubscriptions(msg.agentId);
-        reply(ws, msg, { type: 'comms.subscriptions.result', agentId: msg.agentId, subscriptions });
-      } catch (err) {
-        reply(ws, msg, { type: 'comms.subscriptions.error', agentId: msg.agentId, error: err.message });
-      }
-    });
-
-    registerHandler('comms.inbound', (ws, msg) => {
-      try {
-        const result = commsRouter.route({
-          path: msg.path,
-          externalId: msg.externalId,
-          source: msg.source,
-          payload: msg.payload || {},
-        });
-        reply(ws, msg, { type: 'comms.inbound.ok', ...result });
-      } catch (err) {
-        reply(ws, msg, { type: 'comms.inbound.error', error: err.message });
-      }
-    });
-
-    registerHandler('comms.unmatched', (ws, msg) => {
-      try {
-        const messages = commsRouter.getUnmatched(msg.options || {});
-        reply(ws, msg, { type: 'comms.unmatched.result', messages });
-      } catch (err) {
-        reply(ws, msg, { type: 'comms.unmatched.error', error: err.message });
-      }
-    });
-  }
-
   // ─── WebSocket server ───────────────────────────────────────────────────
 
   const wss = new WebSocketServer({ port, host });
@@ -404,7 +406,7 @@ function start(opts = {}) {
     ws._csAlive = true;
     ws._csAuthed = false;
     ws._csSessions = new Map();
-    ws._csSubscriptions = [];
+    ws._mbSubscriptions = [];
 
     ws.on('pong', () => { ws._csAlive = true; });
 
@@ -466,11 +468,11 @@ function start(opts = {}) {
       }
       ws._csSessions.clear();
 
-      // Clean up message bus subscriptions
-      for (const unsub of ws._csSubscriptions) {
+      // Clean up message broker subscriptions
+      for (const unsub of ws._mbSubscriptions) {
         try { unsub(); } catch { /* ignore */ }
       }
-      ws._csSubscriptions = [];
+      ws._mbSubscriptions = [];
 
       log.info(`[claudeSocket] Client ${clientAddr} disconnected`);
     });

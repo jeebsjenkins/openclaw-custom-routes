@@ -20,7 +20,7 @@
  * }
  *
  * Context passed to execute():
- * { agentId, projectRoot, log, messageBus?, logScanner? }
+ * { agentId, projectRoot, log, messageBroker?, logScanner? }
  */
 
 const fs = require('fs');
@@ -160,7 +160,7 @@ function createToolLoader(projectRoot, log = console) {
    * @param {string} agentId - Agent path ID
    * @param {string} toolName - Tool name to execute
    * @param {object} input - Tool input (validated against schema by the tool)
-   * @param {object} context - Execution context (agentId, projectRoot, log, messageBus, etc.)
+   * @param {object} context - Execution context (agentId, projectRoot, log, messageBroker, etc.)
    * @returns {Promise<{ output: string|object, isError: boolean }>}
    */
   async function executeTool(agentId, toolName, input, context = {}) {
