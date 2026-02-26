@@ -1,5 +1,5 @@
 /**
- * projectManager.js — Manages agent hierarchy, sessions, and conversations on disk.
+ * projectManager.js — Manages agent hierarchy and sessions on disk.
  *
  * Loosely coupled: depends only on Node.js fs/path. No express, ws, or other project deps.
  * Can be extracted to a standalone project by copying this file.
@@ -9,11 +9,11 @@
  *   jvAgent.json        — config (id, name, description, workDirs, defaultModel)
  *   CLAUDE.md            — system prompt / project context
  *   .claude/             — Claude CLI config
- *   sessions/            — session metadata JSON files
- *   conversations/       — conversation log JSONL files
+ *   sessions/            — session metadata (.json) + conversation logs (.jsonl) side-by-side
  *   tools/               — agent-specific tools (optional)
  *
- * Every agent gets a default "main" conversation on creation.
+ * A session IS the agent in a specific conversational context. The "main" session
+ * is the generic agent catch-all. Sessions can have their own broker subscriptions.
  */
 
 const fs = require('fs');
@@ -32,6 +32,9 @@ function createProjectManager(projectRoot) {
 
   // Ensure root exists
   fs.mkdirSync(projectRoot, { recursive: true });
+
+  // Resolve template directory (repo-level templates/agent/)
+  const templateDir = path.join(__dirname, '..', 'templates', 'agent');
 
   // Ensure a "main" agent exists in the root
   const mainDir = path.join(projectRoot, 'main');
@@ -60,7 +63,7 @@ function createProjectManager(projectRoot) {
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
       // Skip known non-agent directories
-      if (['sessions', 'conversations', 'tools', 'node_modules'].includes(entry.name)) continue;
+      if (['sessions', 'tools', 'node_modules'].includes(entry.name)) continue;
 
       const agentPath = path.join(dir, entry.name);
       const configPath = path.join(agentPath, 'jvAgent.json');
@@ -186,54 +189,95 @@ function createProjectManager(projectRoot) {
 
   /**
    * Ensure an agent folder has the required scaffolding.
+   * Clones from templates/agent/ and interpolates {{placeholders}}.
    * Safe to call on an existing directory — only creates what's missing.
-   * Also creates the default "main" conversation.
    */
   function _ensureAgent(agentPath, id, config = {}) {
-    fs.mkdirSync(agentPath, { recursive: true });
-    fs.mkdirSync(path.join(agentPath, '.claude'), { recursive: true });
-    fs.mkdirSync(path.join(agentPath, 'sessions'), { recursive: true });
-    fs.mkdirSync(path.join(agentPath, 'conversations'), { recursive: true });
+    const name = config.name || path.basename(id);
+    const description = config.description || '';
+    const now = Date.now();
 
+    // Template variable map — add new placeholders here
+    const vars = {
+      id,
+      name,
+      description: description || 'Agent project.',
+    };
+
+    // Clone template tree (skip .gitkeep files)
+    _cloneTemplate(templateDir, agentPath, vars);
+
+    // Apply runtime overrides to jvAgent.json (workDirs, defaultModel, etc.)
     const configPath = path.join(agentPath, 'jvAgent.json');
-    if (!fs.existsSync(configPath)) {
-      const name = path.basename(id);
-      const agentConfig = {
-        id,
-        name: config.name || name,
-        description: config.description || '',
-        workDirs: config.workDirs || [],
-        defaultModel: config.defaultModel || null,
-      };
+    if (fs.existsSync(configPath)) {
+      const agentConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (config.workDirs) agentConfig.workDirs = config.workDirs;
+      if (config.defaultModel) agentConfig.defaultModel = config.defaultModel;
+      if (config.subscriptions) agentConfig.subscriptions = config.subscriptions;
       fs.writeFileSync(configPath, JSON.stringify(agentConfig, null, 2));
     }
 
-    const claudeMdPath = path.join(agentPath, 'CLAUDE.md');
-    if (!fs.existsSync(claudeMdPath)) {
-      const name = config.name || path.basename(id);
-      const claudeMd = config.claudeMd || `# ${name}\n\n${config.description || 'Agent project.'}\n\n## Instructions\n\n<!-- Add your system prompt / project context here -->\n`;
-      fs.writeFileSync(claudeMdPath, claudeMd);
+    // Apply custom CLAUDE.md if provided
+    if (config.claudeMd) {
+      fs.writeFileSync(path.join(agentPath, 'CLAUDE.md'), config.claudeMd);
     }
 
-    // Default "main" conversation
-    _ensureDefaultConversation(agentPath);
+    // Stamp timestamps on the default session file
+    const mainSessionPath = path.join(agentPath, 'sessions', 'main.json');
+    if (fs.existsSync(mainSessionPath)) {
+      const session = JSON.parse(fs.readFileSync(mainSessionPath, 'utf8'));
+      if (!session.createdAt) {
+        session.createdAt = now;
+        session.lastUsedAt = now;
+        fs.writeFileSync(mainSessionPath, JSON.stringify(session, null, 2));
+      }
+    }
   }
 
   /**
-   * Create the default "main" session if it doesn't exist.
+   * Recursively copy a template directory to a target, interpolating
+   * {{placeholder}} tokens in text files. Only creates what's missing.
+   *
+   * @param {string} src - Source template directory
+   * @param {string} dest - Destination agent directory
+   * @param {object} vars - Key/value map for {{placeholder}} replacement
    */
-  function _ensureDefaultConversation(agentPath) {
-    const mainSessionPath = path.join(agentPath, 'sessions', 'main.json');
-    if (!fs.existsSync(mainSessionPath)) {
-      const data = {
-        id: 'main',
-        title: 'Main conversation',
-        isDefault: true,
-        createdAt: Date.now(),
-        lastUsedAt: Date.now(),
-      };
-      fs.writeFileSync(mainSessionPath, JSON.stringify(data, null, 2));
+  function _cloneTemplate(src, dest, vars) {
+    fs.mkdirSync(dest, { recursive: true });
+
+    let entries;
+    try {
+      entries = fs.readdirSync(src, { withFileTypes: true });
+    } catch {
+      return; // No template directory — fall through gracefully
     }
+
+    for (const entry of entries) {
+      // Skip .gitkeep files — they're only for preserving dirs in git
+      if (entry.name === '.gitkeep') continue;
+
+      const srcPath = path.join(src, entry.name);
+      const destPath = path.join(dest, entry.name);
+
+      if (entry.isDirectory()) {
+        fs.mkdirSync(destPath, { recursive: true });
+        _cloneTemplate(srcPath, destPath, vars);
+      } else if (!fs.existsSync(destPath)) {
+        // Only create files that don't already exist
+        let content = fs.readFileSync(srcPath, 'utf8');
+        content = _interpolate(content, vars);
+        fs.writeFileSync(destPath, content);
+      }
+    }
+  }
+
+  /**
+   * Replace {{key}} placeholders in a string.
+   */
+  function _interpolate(text, vars) {
+    return text.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+      return key in vars ? vars[key] : match;
+    });
   }
 
   // ─── CLAUDE.md ──────────────────────────────────────────────────────────
@@ -299,16 +343,59 @@ function createProjectManager(projectRoot) {
     return data;
   }
 
+  /**
+   * Create a new named session with optional subscriptions.
+   */
+  function createSession(agentId, sessionId, config = {}) {
+    const sessionsDir = path.join(_agentDir(agentId), 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    const filePath = path.join(sessionsDir, `${sessionId}.json`);
+    if (fs.existsSync(filePath)) {
+      throw new Error(`Session already exists: ${agentId}/${sessionId}`);
+    }
+
+    const now = Date.now();
+    const data = {
+      id: sessionId,
+      title: config.title || sessionId,
+      isDefault: false,
+      subscriptions: config.subscriptions || [],
+      createdAt: now,
+      lastUsedAt: now,
+    };
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    return data;
+  }
+
+  /**
+   * Update a session's metadata (merge with existing).
+   */
+  function updateSession(agentId, sessionId, updates) {
+    const filePath = path.join(_agentDir(agentId), 'sessions', `${sessionId}.json`);
+    let existing = {};
+    try {
+      existing = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      throw new Error(`Session not found: ${agentId}/${sessionId}`);
+    }
+
+    const merged = { ...existing, ...updates, lastUsedAt: Date.now() };
+    fs.writeFileSync(filePath, JSON.stringify(merged, null, 2));
+    return merged;
+  }
+
   // ─── Conversation Logs ────────────────────────────────────────────────
+  // Conversation logs live alongside session metadata in sessions/ as .jsonl files.
 
   /**
    * Append a conversation entry to the session's log file.
    * Each entry is a single JSON line (JSONL format).
    */
   function appendConversationLog(agentId, sessionId, entry) {
-    const convDir = path.join(_agentDir(agentId), 'conversations');
-    fs.mkdirSync(convDir, { recursive: true });
-    const logPath = path.join(convDir, `${sessionId}.jsonl`);
+    const sessionsDir = path.join(_agentDir(agentId), 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const logPath = path.join(sessionsDir, `${sessionId}.jsonl`);
     const line = JSON.stringify({ ...entry, timestamp: Date.now() }) + '\n';
     fs.appendFileSync(logPath, line);
   }
@@ -317,7 +404,7 @@ function createProjectManager(projectRoot) {
    * Read the full conversation log for a session.
    */
   function getConversationLog(agentId, sessionId) {
-    const logPath = path.join(_agentDir(agentId), 'conversations', `${sessionId}.jsonl`);
+    const logPath = path.join(_agentDir(agentId), 'sessions', `${sessionId}.jsonl`);
     try {
       const content = fs.readFileSync(logPath, 'utf8');
       return content.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -385,8 +472,10 @@ function createProjectManager(projectRoot) {
     listSessions,
     getSession,
     saveSession,
+    createSession,
+    updateSession,
 
-    // Conversation logs
+    // Conversation logs (stored in sessions/ alongside metadata)
     appendConversationLog,
     getConversationLog,
   };

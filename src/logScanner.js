@@ -1,10 +1,10 @@
 /**
- * logScanner.js — Grep-like search across agent conversation logs.
+ * logScanner.js — Grep-like search across agent session logs.
  *
  * Loosely coupled: depends only on Node.js fs/path.
  * Can be extracted to a standalone project by copying this file.
  *
- * Searches JSONL conversation logs across agent subtrees using regex
+ * Searches JSONL session logs (in sessions/) across agent subtrees using regex
  * or text patterns, with filtering by role, type, time range, and agent prefix.
  */
 
@@ -82,7 +82,7 @@ function createLogScanner(projectRoot, listAgentsFn, log = console) {
     for (const agent of agents) {
       if (results.length >= limit) break;
 
-      const convDir = path.join(projectRoot, agent.id, 'conversations');
+      const convDir = path.join(projectRoot, agent.id, 'sessions');
       if (!fs.existsSync(convDir)) continue;
 
       let files;

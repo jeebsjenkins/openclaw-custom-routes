@@ -45,6 +45,14 @@
  *   { type: "msg.unmatched", options? }
  *   { type: "msg.unmatched.clear" }
  *
+ * ── Session Messaging (msg.session.*) ──────────────────────────────────
+ *   { type: "msg.session.sub.add", agentId, sessionId, pattern }
+ *   { type: "msg.session.sub.remove", agentId, sessionId, pattern }
+ *   { type: "msg.session.sub.list", agentId, sessionId }
+ *   { type: "msg.session.listen", agentId, sessionId }
+ *   { type: "msg.session.receive", agentId, sessionId }
+ *   { type: "msg.session.history", agentId, sessionId, options? }
+ *
  * ── Sessions ─────────────────────────────────────────────────────────
  * Client → Server:
  *   { type: "session.list", agent }
@@ -359,6 +367,70 @@ function start(opts = {}) {
         reply(ws, msg, { type: 'msg.unmatched.clear.ok', cleared: result.cleared });
       } catch (err) {
         reply(ws, msg, { type: 'msg.unmatched.clear.error', error: err.message });
+      }
+    });
+
+    // ─── Session subscription handlers (msg.session.*) ────────────────────
+
+    registerHandler('msg.session.sub.add', (ws, msg) => {
+      try {
+        messageBroker.subscribeSession(msg.agentId, msg.sessionId, msg.pattern);
+        const subscriptions = messageBroker.getSessionSubscriptions(msg.agentId, msg.sessionId);
+        reply(ws, msg, { type: 'msg.session.sub.add.ok', agentId: msg.agentId, sessionId: msg.sessionId, pattern: msg.pattern, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.session.sub.add.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.session.sub.remove', (ws, msg) => {
+      try {
+        messageBroker.unsubscribeSession(msg.agentId, msg.sessionId, msg.pattern);
+        const subscriptions = messageBroker.getSessionSubscriptions(msg.agentId, msg.sessionId);
+        reply(ws, msg, { type: 'msg.session.sub.remove.ok', agentId: msg.agentId, sessionId: msg.sessionId, pattern: msg.pattern, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.session.sub.remove.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.session.sub.list', (ws, msg) => {
+      try {
+        const subscriptions = messageBroker.getSessionSubscriptions(msg.agentId, msg.sessionId);
+        reply(ws, msg, { type: 'msg.session.sub.list.ok', agentId: msg.agentId, sessionId: msg.sessionId, subscriptions });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.session.sub.list.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.session.listen', (ws, msg) => {
+      try {
+        const unsub = messageBroker.listenSession(msg.agentId, msg.sessionId, (message) => {
+          sendJSON(ws, { type: 'msg.session.push', agentId: msg.agentId, sessionId: msg.sessionId, message });
+        });
+
+        if (!ws._mbSubscriptions) ws._mbSubscriptions = [];
+        ws._mbSubscriptions.push(unsub);
+
+        reply(ws, msg, { type: 'msg.session.listen.ok', agentId: msg.agentId, sessionId: msg.sessionId });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.session.listen.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.session.receive', (ws, msg) => {
+      try {
+        const messages = messageBroker.receiveSession(msg.agentId, msg.sessionId);
+        reply(ws, msg, { type: 'msg.session.receive.ok', agentId: msg.agentId, sessionId: msg.sessionId, messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.session.receive.error', error: err.message });
+      }
+    });
+
+    registerHandler('msg.session.history', (ws, msg) => {
+      try {
+        const messages = messageBroker.sessionHistory(msg.agentId, msg.sessionId, msg.options || {});
+        reply(ws, msg, { type: 'msg.session.history.ok', agentId: msg.agentId, sessionId: msg.sessionId, messages });
+      } catch (err) {
+        reply(ws, msg, { type: 'msg.session.history.error', error: err.message });
       }
     });
   }

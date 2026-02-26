@@ -9,6 +9,7 @@ const { createProjectManager } = require('./projectManager');
 const { createToolLoader } = require('./toolLoader');
 const { createMessageBroker } = require('./messageBroker');
 const { createLogScanner } = require('./logScanner');
+const { createAgentTurnManager } = require('./agentTurnManager');
 
 // Simple structured logger
 const log = {
@@ -102,6 +103,14 @@ async function start() {
       const toolLoader = createToolLoader(config.projectRoot, log);
       const messageBroker = createMessageBroker(config.projectRoot, projectManager, log);
       const logScanner = createLogScanner(config.projectRoot, projectManager.listAgents, log);
+      const turnManager = createAgentTurnManager({
+        messageBroker,
+        projectManager,
+        agentCLIPool,
+        log,
+      });
+      turnManager.start();
+
       log.info(`Project root: ${config.projectRoot}`);
       claudeSocket.start({
         port: config.claudeSocketPort,

@@ -20,6 +20,10 @@
  *
  * Every agent is auto-subscribed to agent/{its-own-id} (computed, not persisted).
  * Custom subscriptions are persisted in jvAgent.json under "subscriptions".
+ * Sessions can also subscribe to paths. Session subscriptions are persisted in
+ * the session's .json file under "subscriptions". When a message matches both a
+ * session and its parent agent, both receive the message — the agent's copy is
+ * flagged with `handled: true` and `handledBy: [{ agentId, sessionId }]`.
  * Unmatched messages go to .messages/broker-unmatched.jsonl.
  *
  * Message format:
@@ -59,12 +63,21 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
   const emitter = new EventEmitter();
   emitter.setMaxListeners(200);
 
-  // Forward index: pattern → Set<agentId>  (custom subscriptions only)
+  // Forward index: pattern → Set<agentId>  (custom agent subscriptions only)
   const subscriptionIndex = new Map();
-  // Reverse index: agentId → Set<pattern>  (custom subscriptions only)
+  // Reverse index: agentId → Set<pattern>  (custom agent subscriptions only)
   const agentIndex = new Map();
   // Auto-subscriptions: agentId → pattern  (computed, not persisted)
   const autoSubs = new Map();
+
+  // Session subscription indexes
+  // Forward: pattern → Set<"agentId:sessionId">
+  const sessionSubIndex = new Map();
+  // Reverse: "agentId:sessionId" → Set<pattern>
+  const sessionIndex = new Map();
+
+  // Route hooks — called after every successful delivery
+  const routeHooks = [];
 
   // Build indexes on startup
   _rebuildIndex();
@@ -137,10 +150,10 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
       externalId: message.externalId || null,
     };
 
-    // Find all agents with matching subscriptions (auto + custom)
-    const matchedAgents = _findMatchingAgents(normalizedPath, from);
+    // Find all matching subscribers (agents + sessions)
+    const { agents: matchedAgents, sessions: matchedSessions } = _findMatchingSubscribers(normalizedPath, from);
 
-    if (matchedAgents.size === 0) {
+    if (matchedAgents.size === 0 && matchedSessions.size === 0) {
       // Dead-letter
       _appendUnmatched({
         id: msg.id,
@@ -155,64 +168,124 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
       });
 
       log.warn(`[messageBroker] No subscribers for: ${normalizedPath}`);
-      return { ...msg, delivered: false, deliveredTo: [], messageIds: [], unmatched: true };
+      return { ...msg, delivered: false, deliveredTo: [], deliveredToSessions: [], messageIds: [], unmatched: true };
     }
 
-    // Persist and deliver to each matched agent
+    // Deliver to matched sessions first
+    const deliveredToSessions = [];
+
+    for (const [key, { agentId, sessionId }] of matchedSessions) {
+      const sessionMsg = { ...msg, _deliveredTo: `${agentId}:${sessionId}` };
+      _appendSessionMessage(agentId, sessionId, sessionMsg);
+      emitter.emit(`session:${agentId}:${sessionId}`, sessionMsg);
+      deliveredToSessions.push({ agentId, sessionId });
+    }
+
+    // Build a map of which agents had sessions handle this message
+    const handledByAgent = new Map(); // agentId → [{ agentId, sessionId }]
+    for (const { agentId, sessionId } of deliveredToSessions) {
+      if (!handledByAgent.has(agentId)) handledByAgent.set(agentId, []);
+      handledByAgent.get(agentId).push({ agentId, sessionId });
+    }
+
+    // Deliver to matched agents with handled flag
     const deliveredTo = [];
     const messageIds = [];
 
     for (const agentId of matchedAgents) {
-      // Create per-agent copy with the agent's path for persistence
-      const agentMsg = { ...msg, _deliveredTo: agentId };
+      const handledBy = handledByAgent.get(agentId) || [];
+      const handled = handledBy.length > 0;
 
-      // Persist to agent's message file
+      const agentMsg = {
+        ...msg,
+        _deliveredTo: agentId,
+        handled,
+        handledBy: handled ? handledBy : undefined,
+      };
+
       _appendMessage(agentId, agentMsg);
-
-      // Real-time delivery via EventEmitter
       emitter.emit(`agent:${agentId}`, agentMsg);
 
       deliveredTo.push(agentId);
       messageIds.push(msg.id);
     }
 
-    log.info(`[messageBroker] ${from} → ${normalizedPath}: ${msg.command} → [${deliveredTo.join(', ')}] (${msg.id})`);
-    return { ...msg, delivered: true, deliveredTo, messageIds, unmatched: false };
-  }
+    const sessionDesc = deliveredToSessions.length > 0
+      ? ` sessions:[${deliveredToSessions.map(s => `${s.agentId}:${s.sessionId}`).join(', ')}]`
+      : '';
+    log.info(`[messageBroker] ${from} → ${normalizedPath}: ${msg.command} → [${deliveredTo.join(', ')}]${sessionDesc} (${msg.id})`);
 
-  /**
-   * Find all agents whose subscriptions (auto + custom) match a path.
-   * Excludes the sender from broadcast-style matches.
-   */
-  function _findMatchingAgents(normalizedPath, from) {
-    const matched = new Set();
+    const result = { ...msg, delivered: true, deliveredTo, deliveredToSessions, messageIds, unmatched: false };
 
-    // Check auto-subscriptions (exact agent/{id} match)
-    for (const [agentId, autoPattern] of autoSubs) {
-      if (pathMatches(autoPattern, normalizedPath)) {
-        matched.add(agentId);
+    // Fire route hooks (async-safe — errors don't break delivery)
+    for (const hook of routeHooks) {
+      try { hook(result); } catch (err) {
+        log.error(`[messageBroker] Route hook error: ${err.message}`);
       }
     }
 
-    // Check custom subscriptions
-    for (const [pattern, agents] of subscriptionIndex) {
-      if (pathMatches(pattern, normalizedPath)) {
-        for (const agentId of agents) {
-          matched.add(agentId);
+    return result;
+  }
+
+  /**
+   * Find all subscribers (agents + sessions) matching a path.
+   * Returns { agents: Set<agentId>, sessions: Map<key, { agentId, sessionId }> }
+   * Excludes the sender from broadcast-style agent matches.
+   */
+  function _findMatchingSubscribers(normalizedPath, from) {
+    const agents = new Set();
+    const sessions = new Map(); // "agentId:sessionId" → { agentId, sessionId }
+
+    // Check agent auto-subscriptions — bidirectional:
+    //   1) sub pattern matches delivery path (normal: sub "agent/researcher" matches path "agent/researcher")
+    //   2) delivery path matches sub pattern (broadcast: path "agent/**" matches sub "agent/researcher")
+    for (const [agentId, autoPattern] of autoSubs) {
+      if (pathMatches(autoPattern, normalizedPath) || pathMatches(normalizedPath, autoPattern)) {
+        agents.add(agentId);
+      }
+    }
+
+    // Check agent custom subscriptions — also bidirectional
+    for (const [pattern, agentSet] of subscriptionIndex) {
+      if (pathMatches(pattern, normalizedPath) || pathMatches(normalizedPath, pattern)) {
+        for (const agentId of agentSet) {
+          agents.add(agentId);
         }
       }
     }
 
-    // For broadcast-style paths (agent/**), exclude the sender
-    if (normalizedPath.startsWith('agent/') && from && matched.has(from)) {
-      // Only exclude sender on wildcard/broadcast, not direct messages
-      const isDirectToSender = normalizedPath === `agent/${from}`;
-      if (!isDirectToSender) {
-        matched.delete(from);
+    // Check session subscriptions — bidirectional
+    for (const [pattern, sessionKeys] of sessionSubIndex) {
+      if (pathMatches(pattern, normalizedPath) || pathMatches(normalizedPath, pattern)) {
+        for (const key of sessionKeys) {
+          if (!sessions.has(key)) {
+            const [agentId, sessionId] = _splitSessionKey(key);
+            sessions.set(key, { agentId, sessionId });
+            // Also ensure the parent agent is in the agent set (cascade)
+            agents.add(agentId);
+          }
+        }
       }
     }
 
-    return matched;
+    // For broadcast-style paths (agent/**), exclude the sender from agents
+    if (normalizedPath.startsWith('agent/') && from && agents.has(from)) {
+      const isDirectToSender = normalizedPath === `agent/${from}`;
+      if (!isDirectToSender) {
+        agents.delete(from);
+      }
+    }
+
+    return { agents, sessions };
+  }
+
+  function _sessionKey(agentId, sessionId) {
+    return `${agentId}:${sessionId}`;
+  }
+
+  function _splitSessionKey(key) {
+    const idx = key.indexOf(':');
+    return [key.slice(0, idx), key.slice(idx + 1)];
   }
 
   // ─── Convenience Methods ───────────────────────────────────────────────
@@ -359,6 +432,147 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
     }
   }
 
+  // ─── Session Subscription Management ────────────────────────────────────
+
+  /**
+   * Add a subscription for a specific session. Persists to session .json.
+   */
+  function subscribeSession(agentId, sessionId, pattern) {
+    if (!agentId) throw new Error('agentId is required');
+    if (!sessionId) throw new Error('sessionId is required');
+    if (!pattern) throw new Error('pattern is required');
+
+    const normalized = _normalize(pattern);
+    const key = _sessionKey(agentId, sessionId);
+
+    // Forward index
+    if (!sessionSubIndex.has(normalized)) {
+      sessionSubIndex.set(normalized, new Set());
+    }
+    sessionSubIndex.get(normalized).add(key);
+
+    // Reverse index
+    if (!sessionIndex.has(key)) {
+      sessionIndex.set(key, new Set());
+    }
+    sessionIndex.get(key).add(normalized);
+
+    // Persist to session .json
+    _persistSessionSubscriptions(agentId, sessionId);
+
+    log.info(`[messageBroker] ${agentId}:${sessionId} subscribed to: ${normalized}`);
+    return { success: true, pattern: normalized };
+  }
+
+  /**
+   * Remove a subscription from a specific session.
+   */
+  function unsubscribeSession(agentId, sessionId, pattern) {
+    if (!agentId) throw new Error('agentId is required');
+    if (!sessionId) throw new Error('sessionId is required');
+    if (!pattern) throw new Error('pattern is required');
+
+    const normalized = _normalize(pattern);
+    const key = _sessionKey(agentId, sessionId);
+
+    const keys = sessionSubIndex.get(normalized);
+    if (keys) {
+      keys.delete(key);
+      if (keys.size === 0) sessionSubIndex.delete(normalized);
+    }
+
+    const patterns = sessionIndex.get(key);
+    if (patterns) {
+      patterns.delete(normalized);
+      if (patterns.size === 0) sessionIndex.delete(key);
+    }
+
+    _persistSessionSubscriptions(agentId, sessionId);
+
+    log.info(`[messageBroker] ${agentId}:${sessionId} unsubscribed from: ${normalized}`);
+    return { success: true, pattern: normalized };
+  }
+
+  /**
+   * Get subscriptions for a specific session.
+   */
+  function getSessionSubscriptions(agentId, sessionId) {
+    if (!agentId) throw new Error('agentId is required');
+    if (!sessionId) throw new Error('sessionId is required');
+
+    const key = _sessionKey(agentId, sessionId);
+    const patterns = sessionIndex.get(key);
+    if (!patterns || patterns.size === 0) return [];
+
+    try {
+      const session = projectManager.getSession(agentId, sessionId);
+      const subs = (session && session.subscriptions) || [];
+      const patternSet = new Set(patterns);
+      return subs.filter(s => patternSet.has(s.pattern));
+    } catch {
+      return [...patterns].map(p => ({ pattern: p, addedAt: null }));
+    }
+  }
+
+  // ─── Session Receiving / Polling ───────────────────────────────────────
+
+  /**
+   * Get pending messages for a specific session and mark them as delivered.
+   */
+  function receiveSession(agentId, sessionId) {
+    if (!agentId) throw new Error('agentId is required');
+    if (!sessionId) throw new Error('sessionId is required');
+
+    const filePath = _sessionMessageFile(agentId, sessionId);
+    const entries = _readJSONL(filePath);
+    const pending = entries.filter(m => m.status === 'pending');
+
+    if (pending.length > 0) {
+      const ids = new Set(pending.map(m => m.id));
+      const updated = entries.map(e => ids.has(e.id) ? { ...e, status: 'delivered' } : e);
+      const content = updated.map(e => JSON.stringify(e)).join('\n') + '\n';
+      fs.writeFileSync(filePath, content);
+    }
+
+    return pending.map(m => ({ ...m, status: 'delivered' }));
+  }
+
+  // ─── Session Real-time Listening ───────────────────────────────────────
+
+  /**
+   * Subscribe to real-time messages for a specific session.
+   * Returns an unsubscribe function.
+   */
+  function listenSession(agentId, sessionId, callback) {
+    if (!agentId) throw new Error('agentId is required');
+    if (!sessionId) throw new Error('sessionId is required');
+
+    const handler = (msg) => callback(msg);
+    emitter.on(`session:${agentId}:${sessionId}`, handler);
+
+    return () => {
+      emitter.off(`session:${agentId}:${sessionId}`, handler);
+    };
+  }
+
+  // ─── Session History ──────────────────────────────────────────────────
+
+  /**
+   * Read message history for a specific session.
+   */
+  function sessionHistory(agentId, sessionId, options = {}) {
+    const { limit = 100, fromTime, toTime } = options;
+
+    const filePath = _sessionMessageFile(agentId, sessionId);
+    let entries = _readJSONL(filePath);
+
+    if (fromTime) entries = entries.filter(e => e.timestamp >= fromTime);
+    if (toTime) entries = entries.filter(e => e.timestamp <= toTime);
+
+    entries.sort((a, b) => b.timestamp - a.timestamp);
+    return entries.slice(0, limit);
+  }
+
   // ─── History ───────────────────────────────────────────────────────────
 
   /**
@@ -408,6 +622,8 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
     subscriptionIndex.clear();
     agentIndex.clear();
     autoSubs.clear();
+    sessionSubIndex.clear();
+    sessionIndex.clear();
 
     try {
       const agents = projectManager.listAgents();
@@ -415,7 +631,7 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
         // Auto-subscription: every agent listens to agent/{id}
         autoSubs.set(agent.id, `agent/${agent.id}`);
 
-        // Custom subscriptions from config
+        // Custom agent subscriptions from config
         try {
           const detail = projectManager.getAgent(agent.id);
           const subs = detail.subscriptions || detail.commsSubscriptions || [];
@@ -434,13 +650,38 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
             agentIndex.get(agent.id).add(pattern);
           }
         } catch { /* skip bad config */ }
+
+        // Session subscriptions
+        try {
+          const sessions = projectManager.listSessions(agent.id);
+          for (const session of sessions) {
+            const sessionSubs = session.subscriptions || [];
+            for (const sub of sessionSubs) {
+              const pattern = _normalize(sub.pattern);
+              if (!pattern) continue;
+
+              const key = _sessionKey(agent.id, session.id);
+
+              if (!sessionSubIndex.has(pattern)) {
+                sessionSubIndex.set(pattern, new Set());
+              }
+              sessionSubIndex.get(pattern).add(key);
+
+              if (!sessionIndex.has(key)) {
+                sessionIndex.set(key, new Set());
+              }
+              sessionIndex.get(key).add(pattern);
+            }
+          }
+        } catch { /* skip if listSessions not available */ }
       }
     } catch (err) {
       log.warn(`[messageBroker] Failed to rebuild index: ${err.message}`);
     }
 
     const customCount = [...subscriptionIndex.values()].reduce((sum, s) => sum + s.size, 0);
-    log.info(`[messageBroker] Index rebuilt: ${autoSubs.size} agents (auto), ${subscriptionIndex.size} patterns (${customCount} custom subscriptions)`);
+    const sessionCount = [...sessionSubIndex.values()].reduce((sum, s) => sum + s.size, 0);
+    log.info(`[messageBroker] Index rebuilt: ${autoSubs.size} agents (auto), ${customCount} custom, ${sessionCount} session subscriptions`);
   }
 
   function rebuildIndex() {
@@ -456,6 +697,17 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
 
   function _appendMessage(agentId, msg) {
     const filePath = _agentMessageFile(agentId);
+    const line = JSON.stringify(msg) + '\n';
+    fs.appendFileSync(filePath, line);
+  }
+
+  function _sessionMessageFile(agentId, sessionId) {
+    const safeName = 'session--' + agentId.replace(/\//g, '--') + '--' + sessionId.replace(/\//g, '--');
+    return path.join(messagesDir, `${safeName}.jsonl`);
+  }
+
+  function _appendSessionMessage(agentId, sessionId, msg) {
+    const filePath = _sessionMessageFile(agentId, sessionId);
     const line = JSON.stringify(msg) + '\n';
     fs.appendFileSync(filePath, line);
   }
@@ -489,6 +741,30 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
     }
   }
 
+  function _persistSessionSubscriptions(agentId, sessionId) {
+    try {
+      const session = projectManager.getSession(agentId, sessionId);
+      const existingSubs = (session && session.subscriptions) || [];
+      const key = _sessionKey(agentId, sessionId);
+      const currentPatterns = sessionIndex.get(key) || new Set();
+
+      const existingMap = new Map(existingSubs.map(s => [s.pattern, s]));
+      const newSubs = [];
+
+      for (const pattern of currentPatterns) {
+        if (existingMap.has(pattern)) {
+          newSubs.push(existingMap.get(pattern));
+        } else {
+          newSubs.push({ pattern, addedAt: Date.now() });
+        }
+      }
+
+      projectManager.updateSession(agentId, sessionId, { subscriptions: newSubs });
+    } catch (err) {
+      log.error(`[messageBroker] Failed to persist session subscriptions for ${agentId}:${sessionId}: ${err.message}`);
+    }
+  }
+
   function _readJSONL(filePath) {
     try {
       const content = fs.readFileSync(filePath, 'utf8');
@@ -496,6 +772,21 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
     } catch {
       return [];
     }
+  }
+
+  // ─── Route Hooks ──────────────────────────────────────────────────────
+
+  /**
+   * Register a callback that fires after every successful route() delivery.
+   * Callback receives the full route result object.
+   * Returns an unsubscribe function.
+   */
+  function onRoute(callback) {
+    routeHooks.push(callback);
+    return () => {
+      const idx = routeHooks.indexOf(callback);
+      if (idx !== -1) routeHooks.splice(idx, 1);
+    };
   }
 
   return {
@@ -512,6 +803,15 @@ function createMessageBroker(projectRoot, projectManager, log = console) {
     clearUnmatched,
     rebuildIndex,
     pathMatches,
+    onRoute,
+
+    // Session-level subscriptions
+    subscribeSession,
+    unsubscribeSession,
+    getSessionSubscriptions,
+    receiveSession,
+    listenSession,
+    sessionHistory,
   };
 }
 
