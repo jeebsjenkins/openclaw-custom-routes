@@ -346,17 +346,79 @@ module.exports = {
       }
     });
 
+    // ─── Slash commands ─────────────────────────────────────────────────
+
+    socketClient.on('slash_commands', async ({ body, ack }) => {
+      // body: { command, text, user_id, user_name, channel_id, channel_name,
+      //         team_id, response_url, trigger_id, ... }
+      const cmd = body.command;     // e.g. "/mobey"
+      const text = body.text || ''; // everything after the command
+      const userId = body.user_id;
+      const channelId = body.channel_id;
+
+      const [user, channel] = await Promise.all([
+        resolveUser(userId),
+        resolveChannel(channelId),
+      ]);
+
+      log.info(`[slack-service] Slash command ${cmd} from ${user.displayName} in #${channel.name}: ${text.slice(0, 80)}`);
+
+      // Acknowledge immediately — Slack requires a response within 3s.
+      // Send a placeholder; the agent's real response comes via the outbound path.
+      await ack({ text: `Got it — processing \`${cmd} ${text}\`...` });
+
+      try {
+        messageBroker.route(`slack/${workspace}/${user.displayName}`, `slack/${workspace}/#${channel.name}`, {
+          command: 'slack.slash',
+          payload: {
+            slashCommand: cmd,
+            text,
+            channelId,
+            channelName: channel.name,
+            userId,
+            userName: user.displayName,
+            responseUrl: body.response_url,
+            triggerId: body.trigger_id,
+          },
+          source: 'slack',
+          externalId: body.trigger_id,
+        });
+      } catch (err) {
+        log.error(`[slack-service] Failed to route slash command: ${err.message}`);
+      }
+    });
+
     // ─── Outbound: Broker → Slack ─────────────────────────────────────────
 
     const senderAgentId = `_slack-sender-${workspace}`;
     messageBroker.subscribe(senderAgentId, `slack/${workspace}/**`);
 
+    const OUTBOUND_COMMANDS = new Set([
+      'slack.send', 'slack.reply', 'slack.slash_response',
+    ]);
+
     const unsubListen = messageBroker.listen(senderAgentId, async (message) => {
-      if (message.command !== 'slack.send' && message.command !== 'slack.reply') return;
+      if (!OUTBOUND_COMMANDS.has(message.command)) return;
 
-      const { channel, channelId, text, thread_ts, blocks, user, userName } = message.payload || {};
+      const { channel, channelId, text, thread_ts, blocks, user, userName, responseUrl } = message.payload || {};
 
-      // Resolve target: could be a channelId, channel name, or user name (for DMs)
+      // Slash command response — POST back to the response_url
+      if (message.command === 'slack.slash_response' && responseUrl) {
+        try {
+          const axios = require('axios');
+          await axios.post(responseUrl, {
+            response_type: message.payload.responseType || 'ephemeral',
+            text: text || '',
+            ...(blocks ? { blocks } : {}),
+          });
+          log.info(`[slack-service] Slash response sent via response_url: ${(text || '').slice(0, 80)}`);
+        } catch (err) {
+          log.error(`[slack-service] Failed to send slash response: ${err.message}`);
+        }
+        return;
+      }
+
+      // Regular send / reply — resolve target channel
       let targetChannel = channelId || channel;
 
       // If targeting a user by name (DM), open the DM channel
