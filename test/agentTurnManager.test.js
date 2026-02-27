@@ -129,6 +129,24 @@ function mockAgentCLIPool(opts = {}) {
 }
 
 /**
+ * Mock Anthropic API client for triage.
+ * The responder controls what the "API" returns.
+ */
+function mockAnthropicClient(opts = {}) {
+  const calls = [];
+  const responder = opts.responder || (() => ({ text: 'YES — relevant message' }));
+
+  return {
+    calls,
+    message: async (params) => {
+      calls.push(params);
+      return responder(params);
+    },
+    resolveModel: (m) => m,
+  };
+}
+
+/**
  * Wait for a condition with timeout.
  */
 function waitFor(conditionFn, timeoutMs = 5000, intervalMs = 50) {
@@ -349,6 +367,138 @@ describe('triage stage', () => {
     assert.equal(pool.calls.execution.length, 1); // ran anyway
     const stats = tm.getStats();
     assert.equal(stats.triageErrors, 1);
+
+    tm.stop();
+  });
+});
+
+// ─── Triage via Anthropic API ────────────────────────────────────────────────
+
+describe('triage via Anthropic API', () => {
+  let root;
+
+  afterEach(() => rmrf(root));
+
+  it('uses anthropicClient.message() for triage when client is provided', async () => {
+    root = tmpDir();
+    const pm = mockProjectManager([{
+      id: 'researcher',
+      autoRun: { enabled: true, debounceMs: 100 },
+      subscriptions: [{ pattern: 'slack/**' }],
+    }]);
+    const broker = createMessageBroker(root, pm, silentLog);
+    const pool = mockAgentCLIPool();
+    const apiClient = mockAnthropicClient({
+      responder: () => ({ text: 'YES — agent should respond' }),
+    });
+    const tm = createAgentTurnManager({
+      messageBroker: broker, projectManager: pm, agentCLIPool: pool,
+      anthropicClient: apiClient, log: silentLog,
+    });
+    tm.start();
+
+    broker.route('system', 'slack/team/#general', { command: 'hello', source: 'slack' });
+
+    await waitFor(() => pool.calls.execution.length > 0, 2000);
+
+    // API client was used for triage, NOT the CLI
+    assert.equal(apiClient.calls.length, 1);
+    assert.equal(pool.calls.triage.length, 0); // CLI triage not called
+    assert.equal(pool.calls.execution.length, 1); // execution still uses CLI
+
+    // Verify API call params
+    const apiCall = apiClient.calls[0];
+    assert.equal(apiCall.model, 'haiku'); // default triage model
+    assert.ok(apiCall.messages[0].content.includes('researcher'));
+    assert.ok(apiCall.messages[0].content.includes('hello'));
+
+    tm.stop();
+  });
+
+  it('skips execution when API triage says NO', async () => {
+    root = tmpDir();
+    const pm = mockProjectManager([{
+      id: 'researcher',
+      autoRun: { enabled: true, debounceMs: 100 },
+      subscriptions: [{ pattern: 'slack/**' }],
+    }]);
+    const broker = createMessageBroker(root, pm, silentLog);
+    const pool = mockAgentCLIPool();
+    const apiClient = mockAnthropicClient({
+      responder: () => ({ text: 'NO — not relevant' }),
+    });
+    const tm = createAgentTurnManager({
+      messageBroker: broker, projectManager: pm, agentCLIPool: pool,
+      anthropicClient: apiClient, log: silentLog,
+    });
+    tm.start();
+
+    broker.route('system', 'slack/team/#general', { command: 'noise', source: 'slack' });
+
+    await waitFor(() => apiClient.calls.length > 0, 2000);
+    await new Promise(r => setTimeout(r, 300));
+
+    assert.equal(apiClient.calls.length, 1);
+    assert.equal(pool.calls.execution.length, 0);
+
+    const stats = tm.getStats();
+    assert.equal(stats.triageRejected, 1);
+
+    tm.stop();
+  });
+
+  it('defaults to running on API triage error', async () => {
+    root = tmpDir();
+    const pm = mockProjectManager([{
+      id: 'researcher',
+      autoRun: { enabled: true, debounceMs: 100 },
+      subscriptions: [{ pattern: 'slack/**' }],
+    }]);
+    const broker = createMessageBroker(root, pm, silentLog);
+    const pool = mockAgentCLIPool();
+    const apiClient = mockAnthropicClient({
+      responder: () => { throw new Error('API rate limited'); },
+    });
+    const tm = createAgentTurnManager({
+      messageBroker: broker, projectManager: pm, agentCLIPool: pool,
+      anthropicClient: apiClient, log: silentLog,
+    });
+    tm.start();
+
+    broker.route('system', 'slack/team/#general', { command: 'hello', source: 'slack' });
+
+    await waitFor(() => pool.calls.execution.length > 0, 2000);
+
+    assert.equal(pool.calls.execution.length, 1);
+    const stats = tm.getStats();
+    assert.equal(stats.triageErrors, 1);
+
+    tm.stop();
+  });
+
+  it('falls back to CLI triage when no anthropicClient is provided', async () => {
+    root = tmpDir();
+    const pm = mockProjectManager([{
+      id: 'researcher',
+      autoRun: { enabled: true, debounceMs: 100 },
+      subscriptions: [{ pattern: 'slack/**' }],
+    }]);
+    const broker = createMessageBroker(root, pm, silentLog);
+    const pool = mockAgentCLIPool();
+    // No anthropicClient passed — should use CLI fallback
+    const tm = createAgentTurnManager({
+      messageBroker: broker, projectManager: pm, agentCLIPool: pool,
+      log: silentLog,
+    });
+    tm.start();
+
+    broker.route('system', 'slack/team/#general', { command: 'hello', source: 'slack' });
+
+    await waitFor(() => pool.calls.execution.length > 0, 2000);
+
+    // CLI was used for triage
+    assert.equal(pool.calls.triage.length, 1);
+    assert.equal(pool.calls.execution.length, 1);
 
     tm.stop();
   });

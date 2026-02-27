@@ -71,8 +71,19 @@
  *   { type: "ping" }  →  { type: "pong" }
  */
 
+const path = require('path');
+const os = require('os');
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
+
+/** Expand leading ~ to the user's home directory. */
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~' || p.startsWith('~/')) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
 
 const AUTH_TIMEOUT_MS = 5000;
 const HEARTBEAT_INTERVAL_MS = 30000;
@@ -586,9 +597,9 @@ function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool) {
 
   // Fallback: resolve directly
   const agent = projectManager.getAgent(agentId);
-  const cliOptions = { ...options, cwd: agent.path };
+  const cliOptions = { ...options, cwd: expandHome(agent.path) };
   if (agent.workDirs && agent.workDirs.length > 0) {
-    cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...agent.workDirs];
+    cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...agent.workDirs.map(expandHome)];
   }
   if (agent.defaultModel && !cliOptions.model) {
     cliOptions.model = agent.defaultModel;
@@ -653,6 +664,9 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
 
   let aborted = false;
   ws._csSessions.set(sessionId, { abort: () => { aborted = true; } });
+
+  // Acknowledge immediately so the client can correlate the reqId
+  reply(ws, msg, { type: 'session.started', sessionId });
 
   log.info(`[claudeSocket] Starting session ${sessionId}: "${prompt.slice(0, 80)}..."`);
 
@@ -720,7 +734,7 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
         } catch { /* non-fatal */ }
       }
       if (ws.readyState === ws.OPEN && !aborted) {
-        sendJSON(ws, { type: 'session.result', sessionId, text: markdown, durationMs });
+        sendJSON(ws, { type: 'session.done', sessionId, durationMs });
       }
     })
     .catch((err) => {

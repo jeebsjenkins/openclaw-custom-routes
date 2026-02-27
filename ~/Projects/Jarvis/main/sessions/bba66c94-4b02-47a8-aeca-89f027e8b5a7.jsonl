@@ -1,0 +1,8 @@
+{"role":"user","type":"prompt","text":"ping","timestamp":1772135460522}
+{"role":"assistant","type":"result","text":"pong","durationMs":3029,"timestamp":1772135463559}
+{"role":"user","type":"prompt","text":"what model are you","timestamp":1772135470840}
+{"role":"assistant","type":"result","text":"I'm Claude Opus 4.6 (model ID: `claude-opus-4-6`).","durationMs":3228,"timestamp":1772135474069}
+{"role":"user","type":"prompt","text":"are you the Claude CLI?","timestamp":1772135707723}
+{"role":"assistant","type":"result","text":"Yes, I'm running as **Claude Code** (the Claude CLI agent). I'm operating inside your project at `~/Projects/Jarvis/main` and have access to tools for reading/writing files, running bash commands, searching code, and more.","durationMs":4358,"timestamp":1772135712087}
+{"role":"user","type":"prompt","text":"write yourself a basic text file","timestamp":1772135742349}
+{"role":"assistant","type":"result","text":"I'll create a simple text file.Looks like write permission was denied. Would you like me to write it to a different location, or would you prefer to allow the write?","durationMs":7794,"timestamp":1772135750145}

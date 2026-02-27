@@ -10,14 +10,29 @@
  *   CLAUDE.md            — system prompt / project context
  *   .claude/             — Claude CLI config
  *   sessions/            — session metadata (.json) + conversation logs (.jsonl) side-by-side
+ *   sessions/{id}/       — per-session directory (workspace/, tmp/, memory/)
  *   tools/               — agent-specific tools (optional)
+ *   workspace/           — agent-level working directory for outputs
+ *   tmp/                 — ephemeral scratch space
+ *   memory/notes.md      — persistent agent memory across sessions
  *
  * A session IS the agent in a specific conversational context. The "main" session
- * is the generic agent catch-all. Sessions can have their own broker subscriptions.
+ * is the generic agent catch-all. Sessions can have their own broker subscriptions,
+ * workDirs, and isolated directory trees.
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+
+/** Expand leading ~ to the user's home directory. */
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~' || p.startsWith('~/')) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
 
 /**
  * Create a ProjectManager instance.
@@ -30,11 +45,26 @@ function createProjectManager(projectRoot) {
     throw new Error('projectManager: projectRoot is required');
   }
 
+  // Expand ~ so dotenv values like ~/Projects/Jarvis work correctly
+  projectRoot = expandHome(projectRoot);
+
   // Ensure root exists
   fs.mkdirSync(projectRoot, { recursive: true });
 
   // Resolve template directory (repo-level templates/agent/)
   const templateDir = path.join(__dirname, '..', 'templates', 'agent');
+
+  // Resolve system template directory (repo-level templates/)
+  const systemTemplateDir = path.join(__dirname, '..', 'templates');
+
+  // Ensure SYSTEM.md exists at project root
+  const systemMdPath = path.join(projectRoot, 'SYSTEM.md');
+  if (!fs.existsSync(systemMdPath)) {
+    const systemTemplatePath = path.join(systemTemplateDir, 'SYSTEM.md');
+    if (fs.existsSync(systemTemplatePath)) {
+      fs.copyFileSync(systemTemplatePath, systemMdPath);
+    }
+  }
 
   // Ensure a "main" agent exists in the root
   const mainDir = path.join(projectRoot, 'main');
@@ -63,7 +93,7 @@ function createProjectManager(projectRoot) {
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
       // Skip known non-agent directories
-      if (['sessions', 'tools', 'node_modules'].includes(entry.name)) continue;
+      if (['sessions', 'tools', 'workspace', 'tmp', 'memory', 'node_modules'].includes(entry.name)) continue;
 
       const agentPath = path.join(dir, entry.name);
       const configPath = path.join(agentPath, 'jvAgent.json');
@@ -130,6 +160,8 @@ function createProjectManager(projectRoot) {
       hasClaudeMd: fs.existsSync(path.join(agentPath, 'CLAUDE.md')),
       hasTools: fs.existsSync(path.join(agentPath, 'tools')),
       subscriptions: config.subscriptions || config.commsSubscriptions || [],
+      heartbeat: config.heartbeat || null,
+      autoRun: config.autoRun || null,
       sessions,
     };
   }
@@ -334,12 +366,21 @@ function createProjectManager(projectRoot) {
     const sessionsDir = path.join(_agentDir(agentId), 'sessions');
     fs.mkdirSync(sessionsDir, { recursive: true });
 
+    const filePath = path.join(sessionsDir, `${sessionId}.json`);
+    const isNew = !fs.existsSync(filePath);
+
     const data = {
       id: sessionId,
       ...metadata,
       lastUsedAt: Date.now(),
     };
-    fs.writeFileSync(path.join(sessionsDir, `${sessionId}.json`), JSON.stringify(data, null, 2));
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+
+    // Scaffold session directory tree on first save
+    if (isNew) {
+      _ensureSessionDirs(agentId, sessionId);
+    }
+
     return data;
   }
 
@@ -361,10 +402,15 @@ function createProjectManager(projectRoot) {
       title: config.title || sessionId,
       isDefault: false,
       subscriptions: config.subscriptions || [],
+      workDirs: config.workDirs || [],
       createdAt: now,
       lastUsedAt: now,
     };
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+
+    // Scaffold session directory tree
+    _ensureSessionDirs(agentId, sessionId);
+
     return data;
   }
 
@@ -411,6 +457,100 @@ function createProjectManager(projectRoot) {
     } catch {
       return [];
     }
+  }
+
+  // ─── Session Directories ─────────────────────────────────────────────────
+  // Each session gets its own directory tree for workspace, tmp, and memory.
+
+  /**
+   * Ensure a session has its directory scaffolding (workspace/, tmp/, memory/).
+   */
+  function _ensureSessionDirs(agentId, sessionId) {
+    const sessionDir = _sessionDir(agentId, sessionId);
+    fs.mkdirSync(path.join(sessionDir, 'workspace'), { recursive: true });
+    fs.mkdirSync(path.join(sessionDir, 'tmp'), { recursive: true });
+    fs.mkdirSync(path.join(sessionDir, 'memory'), { recursive: true });
+
+    // Create session memory/notes.md if missing
+    const notesPath = path.join(sessionDir, 'memory', 'notes.md');
+    if (!fs.existsSync(notesPath)) {
+      fs.writeFileSync(notesPath, `# Session Notes\n\n> Maintained by the agent for this session.\n\n## Context\n\n## Notes\n`);
+    }
+  }
+
+  /**
+   * Get the absolute path to a session's directory.
+   */
+  function _sessionDir(agentId, sessionId) {
+    return path.join(_agentDir(agentId), 'sessions', sessionId);
+  }
+
+  /**
+   * Get the session directory path (public API).
+   */
+  function getSessionDir(agentId, sessionId) {
+    return _sessionDir(agentId, sessionId);
+  }
+
+  // ─── Memory ────────────────────────────────────────────────────────────
+  // Three-tier memory: system (project-wide) → agent → session.
+
+  /**
+   * Read project-wide SYSTEM.md.
+   */
+  function getSystemMemory() {
+    try {
+      return fs.readFileSync(path.join(projectRoot, 'SYSTEM.md'), 'utf8');
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Write project-wide SYSTEM.md.
+   */
+  function updateSystemMemory(content) {
+    fs.writeFileSync(path.join(projectRoot, 'SYSTEM.md'), content);
+  }
+
+  /**
+   * Read agent-level memory/notes.md.
+   */
+  function getAgentMemory(agentId) {
+    try {
+      return fs.readFileSync(path.join(_agentDir(agentId), 'memory', 'notes.md'), 'utf8');
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Write agent-level memory/notes.md.
+   */
+  function updateAgentMemory(agentId, content) {
+    const memDir = path.join(_agentDir(agentId), 'memory');
+    fs.mkdirSync(memDir, { recursive: true });
+    fs.writeFileSync(path.join(memDir, 'notes.md'), content);
+  }
+
+  /**
+   * Read session-level memory/notes.md.
+   */
+  function getSessionMemory(agentId, sessionId) {
+    try {
+      return fs.readFileSync(path.join(_sessionDir(agentId, sessionId), 'memory', 'notes.md'), 'utf8');
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Write session-level memory/notes.md.
+   */
+  function updateSessionMemory(agentId, sessionId, content) {
+    const memDir = path.join(_sessionDir(agentId, sessionId), 'memory');
+    fs.mkdirSync(memDir, { recursive: true });
+    fs.writeFileSync(path.join(memDir, 'notes.md'), content);
   }
 
   // ─── Helpers ────────────────────────────────────────────────────────────
@@ -474,10 +614,19 @@ function createProjectManager(projectRoot) {
     saveSession,
     createSession,
     updateSession,
+    getSessionDir,
 
     // Conversation logs (stored in sessions/ alongside metadata)
     appendConversationLog,
     getConversationLog,
+
+    // Memory (three-tier: system → agent → session)
+    getSystemMemory,
+    updateSystemMemory,
+    getAgentMemory,
+    updateAgentMemory,
+    getSessionMemory,
+    updateSessionMemory,
   };
 }
 

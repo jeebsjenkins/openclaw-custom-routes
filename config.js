@@ -16,6 +16,7 @@ const config = {
   claudeSocketPort: parseInt(process.env.CLAUDE_SOCKET_PORT, 10) || 3101,
   claudeSocketToken: process.env.CLAUDE_SOCKET_TOKEN,
   projectRoot: process.env.PROJECT_ROOT || path.join(require('os').homedir(), '.claude-projects'),
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
 };
 
 module.exports = config;

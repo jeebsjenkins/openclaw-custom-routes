@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaw Agent Console</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1c2333;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-dim: #8b949e;
+      --accent: #58a6ff;
+      --accent-dim: #1f6feb;
+      --green: #3fb950;
+      --red: #f85149;
+      --orange: #d29922;
+      --purple: #bc8cff;
+      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+    }
+    /* Layout */
+    .app { display: grid; grid-template-columns: 280px 1fr 340px; grid-template-rows: 48px 1fr; height: 100vh; }
+    .topbar {
+      grid-column: 1 / -1;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 16px;
+    }
+    .topbar h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.5px; color: var(--accent); }
+    .topbar .conn-status {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; color: var(--text-dim);
+      margin-left: auto;
+    }
+    .topbar .conn-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--red);
+      transition: background 0.3s;
+    }
+    .topbar .conn-dot.connected { background: var(--green); }
+    .topbar .conn-dot.connecting { background: var(--orange); }
+
+    /* Sidebar */
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .sidebar-section { padding: 12px; border-bottom: 1px solid var(--border); }
+    .sidebar-section h3 {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--text-dim); margin-bottom: 8px;
+    }
+    .agent-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+    .agent-item {
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      border-left: 3px solid transparent;
+      transition: all 0.15s;
+    }
+    .agent-item:hover { background: var(--surface2); }
+    .agent-item.active { background: var(--surface2); border-left-color: var(--accent); }
+    .agent-item .agent-name { font-weight: 500; }
+    .agent-item .agent-desc { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+    .session-list { max-height: 200px; overflow-y: auto; }
+    .session-item {
+      padding: 6px 12px 6px 20px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--text-dim);
+      transition: all 0.15s;
+    }
+    .session-item:hover { background: var(--surface2); color: var(--text); }
+    .session-item.active { color: var(--accent); }
+
+    /* Main panel */
+    .main { display: flex; flex-direction: column; overflow: hidden; }
+    .chat-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px;
+      background: var(--surface);
+    }
+    .chat-header .agent-label { font-weight: 600; font-size: 14px; }
+    .chat-header .session-label { font-size: 12px; color: var(--text-dim); }
+    .chat-messages {
+      flex: 1; overflow-y: auto; padding: 16px;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .msg {
+      max-width: 85%;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.5;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--accent-dim);
+      color: #fff;
+      border-bottom-right-radius: 2px;
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--surface2);
+      border-bottom-left-radius: 2px;
+    }
+    .msg.system {
+      align-self: center;
+      background: transparent;
+      color: var(--text-dim);
+      font-size: 11px;
+      font-style: italic;
+      padding: 4px;
+    }
+    .msg.thinking {
+      align-self: flex-start;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--purple);
+      font-style: italic;
+      font-size: 12px;
+    }
+    .msg.tool {
+      align-self: flex-start;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--orange);
+    }
+    .msg.error {
+      align-self: flex-start;
+      background: #2d1b1e;
+      border: 1px solid var(--red);
+      color: var(--red);
+    }
+    .msg .msg-meta {
+      font-size: 10px; color: var(--text-dim); margin-top: 4px;
+    }
+    .streaming-indicator {
+      display: none;
+      align-self: flex-start;
+      padding: 8px 14px;
+      font-size: 12px;
+      color: var(--accent);
+    }
+    .streaming-indicator.active { display: flex; align-items: center; gap: 8px; }
+    .streaming-indicator .dots span {
+      display: inline-block; width: 4px; height: 4px;
+      background: var(--accent); border-radius: 50%;
+      animation: bounce 1.4s infinite ease-in-out both;
+    }
+    .streaming-indicator .dots span:nth-child(1) { animation-delay: -0.32s; }
+    .streaming-indicator .dots span:nth-child(2) { animation-delay: -0.16s; }
+    @keyframes bounce {
+      0%, 80%, 100% { transform: scale(0); }
+      40% { transform: scale(1); }
+    }
+
+    /* Input */
+    .chat-input-area {
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .chat-input-row { display: flex; gap: 8px; }
+    .chat-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 13px;
+      font-family: inherit;
+      resize: none;
+      outline: none;
+      min-height: 40px;
+      max-height: 120px;
+    }
+    .chat-input:focus { border-color: var(--accent); }
+    .send-btn {
+      background: var(--accent-dim);
+      border: none;
+      border-radius: 6px;
+      color: #fff;
+      padding: 0 16px;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .send-btn:hover { background: var(--accent); }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Right panel */
+    .right-panel {
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+    .tab {
+      flex: 1;
+      padding: 10px 8px;
+      text-align: center;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-content { display: none; flex: 1; overflow-y: auto; padding: 12px; }
+    .tab-content.active { display: flex; flex-direction: column; }
+
+    /* Console log */
+    .console-log {
+      flex: 1; overflow-y: auto; font-family: var(--font-mono);
+      font-size: 11px; line-height: 1.6;
+    }
+    .console-entry { padding: 2px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+    .console-entry .ts { color: var(--text-dim); }
+    .console-entry .dir-in { color: var(--green); }
+    .console-entry .dir-out { color: var(--accent); }
+    .console-entry .dir-err { color: var(--red); }
+    .console-entry .payload { color: var(--text); }
+
+    /* Raw message sender */
+    .raw-sender { display: flex; flex-direction: column; gap: 8px; }
+    .raw-sender textarea {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 8px;
+      resize: vertical;
+      min-height: 80px;
+      outline: none;
+    }
+    .raw-sender textarea:focus { border-color: var(--accent); }
+    .raw-send-btn {
+      align-self: flex-end;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .raw-send-btn:hover { border-color: var(--accent); }
+
+    /* Connect form */
+    .connect-form { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
+    .connect-form label { font-size: 11px; color: var(--text-dim); }
+    .connect-form input {
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 4px; padding: 8px 10px; color: var(--text);
+      font-size: 13px; outline: none;
+    }
+    .connect-form input:focus { border-color: var(--accent); }
+    .connect-btn {
+      background: var(--accent-dim); border: none; border-radius: 4px;
+      color: #fff; padding: 8px; font-size: 13px; cursor: pointer;
+      margin-top: 4px;
+    }
+    .connect-btn:hover { background: var(--accent); }
+
+    /* Agent detail */
+    .agent-detail { padding: 12px; font-size: 12px; }
+    .agent-detail .field { margin-bottom: 8px; }
+    .agent-detail .field-label { color: var(--text-dim); font-size: 11px; }
+    .agent-detail .field-value { font-family: var(--font-mono); margin-top: 2px; }
+
+    /* Quick actions */
+    .quick-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .quick-action {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 4px; padding: 4px 10px; font-size: 11px;
+      color: var(--text-dim); cursor: pointer;
+    }
+    .quick-action:hover { border-color: var(--accent); color: var(--text); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+    /* Empty states */
+    .empty-state {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; height: 100%; color: var(--text-dim);
+      font-size: 13px; gap: 8px;
+    }
+    .empty-state .icon { font-size: 32px; opacity: 0.3; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- Top bar -->
+    <div class="topbar">
+      <h1>OPENCLAW CONSOLE</h1>
+      <div class="conn-status">
+        <div class="conn-dot" id="connDot"></div>
+        <span id="connLabel">Disconnected</span>
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="connect-form" id="connectForm">
+        <label>WebSocket URL</label>
+        <input type="text" id="wsUrl" value="ws://localhost:3101" placeholder="ws://host:port">
+        <label>Auth Token</label>
+        <input type="password" id="wsToken" placeholder="CLAUDE_SOCKET_TOKEN">
+        <button class="connect-btn" id="connectBtn" onclick="toggleConnection()">Connect</button>
+      </div>
+      <div class="sidebar-section" style="padding-bottom:4px">
+        <h3>Agents</h3>
+      </div>
+      <div class="agent-list" id="agentList">
+        <div class="empty-state" style="padding:24px;font-size:12px;">Connect to load agents</div>
+      </div>
+      <div class="sidebar-section">
+        <h3>Sessions</h3>
+        <div class="session-list" id="sessionList"></div>
+      </div>
+    </div>
+
+    <!-- Main chat area -->
+    <div class="main">
+      <div class="chat-header">
+        <span class="agent-label" id="chatAgentLabel">No agent selected</span>
+        <span class="session-label" id="chatSessionLabel"></span>
+        <div style="margin-left:auto; display:flex; gap:6px;">
+          <button class="quick-action" onclick="newSession()" title="Start new session">+ New Session</button>
+          <button class="quick-action" onclick="loadHistory()" title="Load conversation history">History</button>
+        </div>
+      </div>
+      <div class="chat-messages" id="chatMessages">
+        <div class="empty-state">
+          <div class="icon">&#9671;</div>
+          <div>Select an agent and start a conversation</div>
+        </div>
+      </div>
+      <div class="streaming-indicator" id="streamingIndicator">
+        <div class="dots"><span></span><span></span><span></span></div>
+        <span>Agent is responding...</span>
+      </div>
+      <div class="chat-input-area">
+        <div class="chat-input-row">
+          <textarea class="chat-input" id="chatInput" placeholder="Send a message..." rows="1"
+            onkeydown="handleInputKey(event)"></textarea>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right panel -->
+    <div class="right-panel">
+      <div class="tabs">
+        <div class="tab active" onclick="switchTab('console')">Console</div>
+        <div class="tab" onclick="switchTab('raw')">Raw</div>
+        <div class="tab" onclick="switchTab('detail')">Detail</div>
+      </div>
+      <div class="tab-content active" id="tab-console">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <span style="font-size:11px; color:var(--text-dim);">WebSocket Messages</span>
+          <button class="quick-action" onclick="copyConsole()">Copy Log</button>
+          <button class="quick-action" onclick="clearConsole()">Clear</button>
+        </div>
+        <div class="console-log" id="consoleLog"></div>
+      </div>
+      <div class="tab-content" id="tab-raw">
+        <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px;">Send raw JSON to the socket</div>
+        <div class="raw-sender">
+          <textarea id="rawInput" placeholder='{"type": "agent.list"}'></textarea>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <div class="quick-actions" style="flex:1; margin:0;">
+              <button class="quick-action" onclick="rawQuick('agent.list')">agent.list</button>
+              <button class="quick-action" onclick="rawQuick('ping')">ping</button>
+              <button class="quick-action" onclick="rawQuick('logs.conversations')">logs</button>
+              <button class="quick-action" onclick="rawQuick('msg.unmatched')">unmatched</button>
+            </div>
+            <button class="raw-send-btn" onclick="sendRaw()">Send</button>
+          </div>
+        </div>
+        <div style="font-size:11px; color:var(--text-dim); margin:12px 0 4px;">Response</div>
+        <div class="console-log" id="rawResponse" style="flex:1;"></div>
+      </div>
+      <div class="tab-content" id="tab-detail">
+        <div class="agent-detail" id="agentDetail">
+          <div class="empty-state" style="font-size:12px;">Select an agent to view details</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ─── State ─────────────────────────────────────────────────────────
+let ws = null;
+let reqCounter = 0;
+const pendingRequests = new Map();
+let selectedAgent = null;
+let selectedSession = null;
+let isStreaming = false;
+let streamBuffer = '';
+
+// ─── WebSocket Connection ──────────────────────────────────────────
+
+function toggleConnection() {
+  if (ws && ws.readyState <= 1) {
+    ws.close();
+    return;
+  }
+  connect();
+}
+
+function connect() {
+  const url = document.getElementById('wsUrl').value;
+  const token = document.getElementById('wsToken').value;
+  if (!url || !token) return;
+
+  setConnState('connecting');
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    logConsole('out', 'auth', { type: 'auth', token: '***' });
+    ws.send(JSON.stringify({ type: 'auth', token }));
+  };
+
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+
+    logConsole('in', msg.type, msg);
+
+    // Handle reqId correlation
+    if (msg.reqId && pendingRequests.has(msg.reqId)) {
+      const { resolve } = pendingRequests.get(msg.reqId);
+      pendingRequests.delete(msg.reqId);
+      resolve(msg);
+    }
+
+    handleMessage(msg);
+  };
+
+  ws.onclose = () => {
+    setConnState('disconnected');
+    ws = null;
+  };
+
+  ws.onerror = () => {
+    setConnState('disconnected');
+  };
+}
+
+function setConnState(state) {
+  const dot = document.getElementById('connDot');
+  const label = document.getElementById('connLabel');
+  const btn = document.getElementById('connectBtn');
+  dot.className = 'conn-dot ' + state;
+  label.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+  btn.textContent = state === 'disconnected' ? 'Connect' : 'Disconnect';
+  document.getElementById('sendBtn').disabled = state !== 'connected';
+}
+
+// ─── Message send/receive helpers ──────────────────────────────────
+
+function send(msg, timeoutMs = 30000) {
+  if (!ws || ws.readyState !== 1) return Promise.reject(new Error('Not connected'));
+  const reqId = 'r' + (++reqCounter);
+  msg.reqId = reqId;
+  logConsole('out', msg.type, msg);
+  ws.send(JSON.stringify(msg));
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(reqId, { resolve, reject });
+    setTimeout(() => {
+      if (pendingRequests.has(reqId)) {
+        pendingRequests.delete(reqId);
+        reject(new Error('Request timeout'));
+      }
+    }, timeoutMs);
+  });
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'auth.ok':
+      setConnState('connected');
+      loadAgents();
+      break;
+    case 'auth.error':
+      setConnState('disconnected');
+      addChatMessage('system', `Auth failed: ${msg.error}`);
+      break;
+
+    // Streaming session events
+    case 'session.thinking':
+      handleStreamEvent('thinking', msg.text);
+      break;
+    case 'session.text':
+      handleStreamEvent('text', msg.text);
+      break;
+    case 'session.started':
+      // Ack — session is running, capture sessionId
+      if (msg.sessionId && selectedAgent) {
+        selectedSession = msg.sessionId;
+        document.getElementById('chatSessionLabel').textContent = `Session: ${msg.sessionId.slice(0, 8)}...`;
+      }
+      break;
+    case 'session.result':
+      handleStreamResult(msg);
+      break;
+    case 'session.done':
+      handleStreamDone(msg);
+      break;
+    case 'session.tool_use':
+    case 'session.tool_use_start':
+      handleStreamEvent('tool', `Tool: ${msg.name}` + (msg.input ? '\n' + JSON.stringify(msg.input, null, 2) : ''));
+      break;
+    case 'session.tool_input_delta':
+      // accumulate silently
+      break;
+    case 'session.tool_result':
+      handleStreamEvent('tool', `Result: ${typeof msg.content === 'string' ? msg.content.slice(0, 500) : JSON.stringify(msg.content).slice(0, 500)}`);
+      break;
+    case 'session.error':
+      setStreaming(false);
+      // Clear session so next message starts fresh instead of trying to --resume a dead session
+      selectedSession = null;
+      document.getElementById('chatSessionLabel').textContent = '';
+      addChatMessage('error', msg.error);
+      break;
+
+    // Push messages from broker
+    case 'msg.push':
+    case 'msg.session.push':
+      addChatMessage('system', `[Broker] ${msg.message?.from}: ${msg.message?.command || ''} → ${JSON.stringify(msg.message?.payload || {}).slice(0, 200)}`);
+      break;
+  }
+}
+
+// ─── Streaming ─────────────────────────────────────────────────────
+
+function handleStreamEvent(kind, text) {
+  if (!isStreaming) setStreaming(true);
+
+  if (kind === 'text') {
+    streamBuffer += text;
+    updateStreamMessage(streamBuffer);
+  } else if (kind === 'thinking') {
+    addChatMessage('thinking', text);
+  } else if (kind === 'tool') {
+    addChatMessage('tool', text);
+  }
+}
+
+function handleStreamResult(msg) {
+  // This is the streaming result event — contains the final text from the CLI
+  if (streamBuffer) {
+    // Text was already accumulated via session.text deltas — nothing to add
+  } else if (msg.text) {
+    // No deltas arrived, so show the full result as a single message
+    addChatMessage('assistant', msg.text);
+  }
+}
+
+function handleStreamDone(msg) {
+  // session.done fires after result + persistence — marks the end of the stream
+  setStreaming(false);
+  streamBuffer = '';
+  if (msg.durationMs) {
+    addChatMessage('system', `Completed in ${(msg.durationMs / 1000).toFixed(1)}s`);
+  }
+}
+
+let currentStreamEl = null;
+function updateStreamMessage(text) {
+  if (!currentStreamEl) {
+    currentStreamEl = document.createElement('div');
+    currentStreamEl.className = 'msg assistant';
+    document.getElementById('chatMessages').appendChild(currentStreamEl);
+  }
+  currentStreamEl.textContent = text;
+  scrollChat();
+}
+
+function setStreaming(active) {
+  isStreaming = active;
+  document.getElementById('streamingIndicator').className = 'streaming-indicator' + (active ? ' active' : '');
+  document.getElementById('sendBtn').disabled = active || !ws || ws.readyState !== 1;
+  if (!active) {
+    currentStreamEl = null;
+  }
+}
+
+// ─── Chat UI ───────────────────────────────────────────────────────
+
+function addChatMessage(role, text) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  el.textContent = text;
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+  meta.textContent = new Date().toLocaleTimeString();
+  el.appendChild(meta);
+  document.getElementById('chatMessages').appendChild(el);
+  scrollChat();
+}
+
+function scrollChat() {
+  const c = document.getElementById('chatMessages');
+  c.scrollTop = c.scrollHeight;
+}
+
+function clearChat() {
+  document.getElementById('chatMessages').innerHTML = '';
+}
+
+function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text || !selectedAgent) return;
+
+  addChatMessage('user', text);
+  input.value = '';
+  input.style.height = 'auto';
+  streamBuffer = '';
+
+  const msg = {
+    type: selectedSession ? 'session.continue' : 'session.start',
+    agent: selectedAgent,
+    prompt: text,
+  };
+  if (selectedSession) {
+    msg.sessionId = selectedSession;
+  }
+
+  // Use send() which awaits the session.started ack (with reqId), but use a
+  // longer timeout since we only need the ack, not the full response.
+  send(msg, 120000).catch(err => addChatMessage('error', err.message));
+}
+
+function handleInputKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+  // Auto-resize
+  const ta = e.target;
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+}
+
+// ─── Agent / Session management ────────────────────────────────────
+
+async function loadAgents() {
+  try {
+    const res = await send({ type: 'agent.list' });
+    const agents = res.agents || [];
+    const list = document.getElementById('agentList');
+    if (!agents.length) {
+      list.innerHTML = '<div class="empty-state" style="padding:24px;font-size:12px;">No agents found</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const a of agents) {
+      const el = document.createElement('div');
+      el.className = 'agent-item' + (selectedAgent === a.id ? ' active' : '');
+      el.innerHTML = `<div class="agent-name">${esc(a.id)}</div>` +
+        (a.description ? `<div class="agent-desc">${esc(a.description)}</div>` : '');
+      el.onclick = () => selectAgent(a.id);
+      list.appendChild(el);
+    }
+  } catch (err) {
+    logConsole('err', 'error', { error: err.message });
+  }
+}
+
+async function selectAgent(id) {
+  selectedAgent = id;
+  selectedSession = null;
+  clearChat();
+  addChatMessage('system', `Selected agent: ${id}`);
+
+  // Update sidebar
+  document.querySelectorAll('.agent-item').forEach(el => {
+    el.classList.toggle('active', el.querySelector('.agent-name')?.textContent === id);
+  });
+  document.getElementById('chatAgentLabel').textContent = id;
+  document.getElementById('chatSessionLabel').textContent = '';
+
+  // Load sessions
+  try {
+    const res = await send({ type: 'session.list', agent: id });
+    const sessions = res.sessions || [];
+    const list = document.getElementById('sessionList');
+    list.innerHTML = '';
+    for (const s of sessions) {
+      const el = document.createElement('div');
+      el.className = 'session-item';
+      el.textContent = s.title || s.id?.slice(0, 12) || 'untitled';
+      el.onclick = () => selectSession(s.id, s.title);
+      list.appendChild(el);
+    }
+  } catch { /* no sessions yet */ }
+
+  // Load agent detail
+  try {
+    const res = await send({ type: 'agent.get', id });
+    showAgentDetail(res.agent || res);
+  } catch {}
+
+  // Subscribe to live messages for this agent
+  try {
+    await send({ type: 'msg.listen', agentId: id });
+  } catch {}
+}
+
+function selectSession(id, title) {
+  selectedSession = id;
+  document.getElementById('chatSessionLabel').textContent = `Session: ${title || id.slice(0, 8)}`;
+  document.querySelectorAll('.session-item').forEach(el => {
+    el.classList.toggle('active', el.textContent === (title || id.slice(0, 12)));
+  });
+  addChatMessage('system', `Switched to session: ${id.slice(0, 12)}`);
+  loadHistory();
+}
+
+function newSession() {
+  selectedSession = null;
+  clearChat();
+  document.getElementById('chatSessionLabel').textContent = 'New session';
+  addChatMessage('system', 'Starting new session — send a message to begin.');
+}
+
+async function loadHistory() {
+  if (!selectedAgent || !selectedSession) return;
+  try {
+    const res = await send({ type: 'conversation.history', agent: selectedAgent, sessionId: selectedSession });
+    const entries = res.entries || [];
+    clearChat();
+    for (const e of entries) {
+      const role = e.role === 'user' ? 'user' : e.role === 'assistant' ? 'assistant' : 'system';
+      addChatMessage(role, e.text || e.content || JSON.stringify(e));
+    }
+    if (!entries.length) {
+      addChatMessage('system', 'No conversation history for this session.');
+    }
+  } catch (err) {
+    addChatMessage('error', `Failed to load history: ${err.message}`);
+  }
+}
+
+function showAgentDetail(agent) {
+  const d = document.getElementById('agentDetail');
+  if (!agent) { d.innerHTML = '<div class="empty-state">No data</div>'; return; }
+  let html = '';
+  const fields = [
+    ['ID', agent.id],
+    ['Name', agent.name],
+    ['Description', agent.description],
+    ['Model', agent.defaultModel],
+    ['Work Dirs', agent.workDirs?.join(', ')],
+    ['Subscriptions', agent.subscriptions?.join(', ')],
+    ['Path', agent.path],
+  ];
+  for (const [label, val] of fields) {
+    if (val) html += `<div class="field"><div class="field-label">${label}</div><div class="field-value">${esc(String(val))}</div></div>`;
+  }
+  html += '<div style="margin-top:12px"><div class="field-label">Quick Actions</div></div>';
+  html += '<div class="quick-actions" style="margin-top:6px">';
+  html += `<button class="quick-action" onclick="getClaudeMd()">CLAUDE.md</button>`;
+  html += `<button class="quick-action" onclick="listTools()">Tools</button>`;
+  html += `<button class="quick-action" onclick="getMsgHistory()">Messages</button>`;
+  html += `<button class="quick-action" onclick="getSubscriptions()">Subs</button>`;
+  html += '</div>';
+  d.innerHTML = html;
+}
+
+async function getClaudeMd() {
+  if (!selectedAgent) return;
+  try {
+    const res = await send({ type: 'agent.claudemd.get', id: selectedAgent });
+    addChatMessage('system', `--- CLAUDE.md for ${selectedAgent} ---\n${res.content || '(empty)'}`);
+  } catch (err) { addChatMessage('error', err.message); }
+}
+
+async function listTools() {
+  if (!selectedAgent) return;
+  try {
+    const res = await send({ type: 'agent.tools.list', agentId: selectedAgent });
+    const tools = res.tools || [];
+    addChatMessage('system', `Tools for ${selectedAgent}:\n${tools.map(t => `  • ${t.name}: ${t.description || ''}`).join('\n') || '(none)'}`);
+  } catch (err) { addChatMessage('error', err.message); }
+}
+
+async function getMsgHistory() {
+  if (!selectedAgent) return;
+  try {
+    const res = await send({ type: 'msg.history', agentId: selectedAgent, options: { limit: 20 } });
+    const msgs = res.messages || [];
+    addChatMessage('system', `Recent messages for ${selectedAgent}:\n${msgs.map(m => `  [${m.from}] ${m.command}: ${JSON.stringify(m.payload).slice(0, 100)}`).join('\n') || '(none)'}`);
+  } catch (err) { addChatMessage('error', err.message); }
+}
+
+async function getSubscriptions() {
+  if (!selectedAgent) return;
+  try {
+    const res = await send({ type: 'msg.sub.list', agentId: selectedAgent });
+    addChatMessage('system', `Subscriptions for ${selectedAgent}:\n${(res.subscriptions || []).map(s => `  • ${s}`).join('\n') || '(none)'}`);
+  } catch (err) { addChatMessage('error', err.message); }
+}
+
+// ─── Console ───────────────────────────────────────────────────────
+
+function logConsole(dir, type, data) {
+  const log = document.getElementById('consoleLog');
+  const el = document.createElement('div');
+  el.className = 'console-entry';
+  const ts = new Date().toLocaleTimeString();
+  const dirClass = dir === 'in' ? 'dir-in' : dir === 'err' ? 'dir-err' : 'dir-out';
+  const arrow = dir === 'in' ? '◀' : dir === 'err' ? '✕' : '▶';
+  const payload = typeof data === 'object' ? JSON.stringify(data) : data;
+  // Truncate long payloads in the console
+  const truncated = payload.length > 300 ? payload.slice(0, 300) + '…' : payload;
+  el.innerHTML = `<span class="ts">${ts}</span> <span class="${dirClass}">${arrow} ${esc(type)}</span> <span class="payload">${esc(truncated)}</span>`;
+  el.title = payload; // full payload on hover
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearConsole() {
+  document.getElementById('consoleLog').innerHTML = '';
+}
+
+function copyConsole() {
+  const entries = document.querySelectorAll('#consoleLog .console-entry');
+  const text = Array.from(entries).map(el => el.title || el.textContent).join('\n');
+  navigator.clipboard.writeText(text).then(() => {
+    // Brief visual feedback on the button
+    const btn = document.querySelector('[onclick="copyConsole()"]');
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = orig; }, 1200);
+  });
+}
+
+// ─── Raw sender ────────────────────────────────────────────────────
+
+function rawQuick(type) {
+  document.getElementById('rawInput').value = JSON.stringify({ type }, null, 2);
+}
+
+async function sendRaw() {
+  const input = document.getElementById('rawInput');
+  const resp = document.getElementById('rawResponse');
+  let msg;
+  try {
+    msg = JSON.parse(input.value);
+  } catch {
+    resp.innerHTML = '<span style="color:var(--red)">Invalid JSON</span>';
+    return;
+  }
+  try {
+    const result = await send(msg);
+    resp.textContent = JSON.stringify(result, null, 2);
+  } catch (err) {
+    resp.innerHTML = `<span style="color:var(--red)">${esc(err.message)}</span>`;
+  }
+}
+
+// ─── Tabs ──────────────────────────────────────────────────────────
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.textContent.toLowerCase() === name));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + name));
+}
+
+// ─── Util ──────────────────────────────────────────────────────────
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

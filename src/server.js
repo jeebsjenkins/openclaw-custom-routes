@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const config = require('../config');
 const RouteLoader = require('./loader');
@@ -10,16 +12,35 @@ const { createToolLoader } = require('./toolLoader');
 const { createMessageBroker } = require('./messageBroker');
 const { createLogScanner } = require('./logScanner');
 const { createAgentTurnManager } = require('./agentTurnManager');
+const { createAnthropicClient } = require('./anthropicHelper');
 
-// Simple structured logger
+// --- File logger ---
+const logDir = path.join(__dirname, '..', 'log');
+if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+
+function appendToLogFile(level, args) {
+  const ts = new Date().toISOString();
+  const line = `[${level.toUpperCase()}]  ${ts} ${args.map(a => typeof a === 'string' ? a : JSON.stringify(a, null, 2)).join(' ')}\n`;
+  const dateStr = ts.slice(0, 10); // YYYY-MM-DD
+  fs.appendFile(path.join(logDir, `${dateStr}.log`), line, () => {});
+  // Also write errors/warns to a dedicated error log for easy scanning
+  if (level === 'error' || level === 'warn') {
+    fs.appendFile(path.join(logDir, 'error.log'), line, () => {});
+  }
+}
+
+// Simple structured logger — writes to stdout AND log/ files
 const log = {
-  info:  (...args) => console.log(`[INFO]  ${new Date().toISOString()}`, ...args),
-  warn:  (...args) => console.warn(`[WARN]  ${new Date().toISOString()}`, ...args),
-  error: (...args) => console.error(`[ERROR] ${new Date().toISOString()}`, ...args),
+  info:  (...args) => { console.log(`[INFO]  ${new Date().toISOString()}`, ...args);  appendToLogFile('info', args);  },
+  warn:  (...args) => { console.warn(`[WARN]  ${new Date().toISOString()}`, ...args); appendToLogFile('warn', args);  },
+  error: (...args) => { console.error(`[ERROR] ${new Date().toISOString()}`, ...args); appendToLogFile('error', args); },
 };
 
 const app = express();
 app.use(express.json());
+
+// Static assets (dashboard UI, etc.)
+app.use('/public', express.static(path.join(__dirname, '..', 'public')));
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -103,10 +124,20 @@ async function start() {
       const toolLoader = createToolLoader(config.projectRoot, log);
       const messageBroker = createMessageBroker(config.projectRoot, projectManager, log);
       const logScanner = createLogScanner(config.projectRoot, projectManager.listAgents, log);
+      // Create Anthropic API client for lightweight triage (optional — falls back to CLI)
+      let anthropicClient = null;
+      if (config.anthropicApiKey) {
+        anthropicClient = createAnthropicClient({ apiKey: config.anthropicApiKey, log });
+        log.info('Anthropic API client enabled for triage');
+      } else {
+        log.info('ANTHROPIC_API_KEY not set — triage will use Claude CLI fallback');
+      }
+
       const turnManager = createAgentTurnManager({
         messageBroker,
         projectManager,
         agentCLIPool,
+        anthropicClient,
         log,
       });
       turnManager.start();

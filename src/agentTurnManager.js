@@ -59,6 +59,7 @@ const DEFAULT_EXECUTION_TIMEOUT_MS = 300000; // 5 min max for execution
  * @param {object} opts.messageBroker   - MessageBroker instance (onRoute, receiveSession, etc.)
  * @param {object} opts.projectManager  - ProjectManager instance
  * @param {object} opts.agentCLIPool    - AgentCLIPool instance
+ * @param {object} [opts.anthropicClient] - AnthropicClient for triage (from anthropicHelper)
  * @param {object} [opts.log]           - Logger
  * @param {object} [opts.defaults]      - Global defaults for triage/debounce
  * @returns {object} AgentTurnManager API
@@ -68,6 +69,7 @@ function createAgentTurnManager(opts) {
     messageBroker,
     projectManager,
     agentCLIPool,
+    anthropicClient = null,
     log = console,
     defaults = {},
   } = opts;
@@ -321,10 +323,10 @@ function createAgentTurnManager(opts) {
 
   // ─── Stage 1: Triage ──────────────────────────────────────────────────────
 
-  async function _triage(agentId, sessionId, messages, config, turnId) {
-    stats.triageCount++;
-
-    // Build context for triage
+  /**
+   * Build the triage prompt from agent context and inbound messages.
+   */
+  function _buildTriagePrompt(agentId, sessionId, messages) {
     let agentDescription = '';
     try {
       const agent = projectManager.getAgent(agentId);
@@ -342,7 +344,7 @@ function createAgentTurnManager(opts) {
       return parts.join('\n');
     }).join('\n');
 
-    const triagePrompt = [
+    return [
       `You are a message triage system. Decide if this agent should run a turn.`,
       ``,
       `Agent: "${agentId}"`,
@@ -359,16 +361,51 @@ function createAgentTurnManager(opts) {
       ``,
       `Reply with exactly YES or NO on the first line, then a brief reason.`,
     ].join('\n');
+  }
+
+  /**
+   * Triage via direct Anthropic API call (fast, lightweight).
+   */
+  async function _triageViaAPI(triagePrompt, config, turnId) {
+    const result = await anthropicClient.message({
+      model: config.triageModel,  // alias like 'haiku' resolved by anthropicClient
+      maxTokens: 128,
+      temperature: 0,
+      messages: [{ role: 'user', content: triagePrompt }],
+      timeoutMs: config.triageTimeoutMs,
+    });
+
+    return result.text || '';
+  }
+
+  /**
+   * Triage via Claude CLI (fallback when no API key is configured).
+   */
+  async function _triageViaCLI(agentId, triagePrompt, config) {
+    const cli = agentCLIPool.getAgentCLI(agentId);
+    const result = await cli.query(triagePrompt, {
+      model: config.triageModel,
+      timeoutMs: config.triageTimeoutMs,
+      noSessionPersistence: true,
+    });
+
+    return (result.markdown || result.text || '').trim();
+  }
+
+  async function _triage(agentId, sessionId, messages, config, turnId) {
+    stats.triageCount++;
+
+    const triagePrompt = _buildTriagePrompt(agentId, sessionId, messages);
 
     try {
-      const cli = agentCLIPool.getAgentCLI(agentId);
-      const result = await cli.query(triagePrompt, {
-        model: config.triageModel,
-        timeoutMs: config.triageTimeoutMs,
-        noSessionPersistence: true, // don't pollute session history with triage
-      });
+      let text;
 
-      const text = (result.markdown || result.text || '').trim();
+      if (anthropicClient) {
+        text = await _triageViaAPI(triagePrompt, config, turnId);
+      } else {
+        text = await _triageViaCLI(agentId, triagePrompt, config);
+      }
+
       const firstLine = text.split('\n')[0].toUpperCase();
       const accepted = firstLine.startsWith('YES');
 
@@ -386,6 +423,42 @@ function createAgentTurnManager(opts) {
       // Default to running on triage failure — better to over-run than miss messages
       return true;
     }
+  }
+
+  // ─── Memory Assembly ─────────────────────────────────────────────────────
+
+  /**
+   * Assemble the three-tier memory context for a turn.
+   * Passed to the CLI via --system-prompt so it's separate from the user prompt.
+   */
+  function _assembleMemoryContext(agentId, sessionId) {
+    const parts = [];
+
+    // System memory (project-wide)
+    try {
+      const systemMem = projectManager.getSystemMemory();
+      if (systemMem.trim()) {
+        parts.push(`=== SYSTEM CONTEXT ===\n${systemMem}`);
+      }
+    } catch { /* non-fatal */ }
+
+    // Agent memory
+    try {
+      const agentMem = projectManager.getAgentMemory(agentId);
+      if (agentMem.trim()) {
+        parts.push(`=== AGENT MEMORY ===\n${agentMem}`);
+      }
+    } catch { /* non-fatal */ }
+
+    // Session memory
+    try {
+      const sessionMem = projectManager.getSessionMemory(agentId, sessionId);
+      if (sessionMem.trim()) {
+        parts.push(`=== SESSION MEMORY ===\n${sessionMem}`);
+      }
+    } catch { /* non-fatal */ }
+
+    return parts.length > 0 ? parts.join('\n\n') : '';
   }
 
   // ─── Stage 2: Execution ────────────────────────────────────────────────────
@@ -420,15 +493,36 @@ function createAgentTurnManager(opts) {
       `Process these messages according to your role and instructions.`,
       `Use your available tools to take action as needed.`,
       `If a message requires a reply, use the send-message tool.`,
+      `Update your memory/notes.md if you learn anything important.`,
     ].join('\n');
 
     try {
       const cli = agentCLIPool.getAgentCLI(agentId);
 
-      const result = await cli.query(prompt, {
+      // Assemble memory context for --system-prompt
+      const memoryContext = _assembleMemoryContext(agentId, sessionId);
+
+      const cliOptions = {
         resumeSessionId: sessionId,
         timeoutMs: config.executionTimeoutMs,
-      });
+      };
+      if (memoryContext) {
+        cliOptions.systemPrompt = memoryContext;
+      }
+
+      // Include session directory as an additional dir
+      try {
+        const sessionDir = projectManager.getSessionDir(agentId, sessionId);
+        cliOptions.additionalDirs = [sessionDir];
+
+        // Also merge session-level workDirs if any
+        const session = projectManager.getSession(agentId, sessionId);
+        if (session && session.workDirs && session.workDirs.length > 0) {
+          cliOptions.additionalDirs.push(...session.workDirs);
+        }
+      } catch { /* non-fatal */ }
+
+      const result = await cli.query(prompt, cliOptions);
 
       const responseText = (result.markdown || result.text || '').trim();
 

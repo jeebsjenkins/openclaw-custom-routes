@@ -6,6 +6,15 @@ const os = require('os');
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CLI_TTL_MS = 10 * 60 * 1000; // 10 minutes idle before eviction
 
+/** Expand leading ~ to the user's home directory. */
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~' || p.startsWith('~/')) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
+
 function cleanEnv() {
   const env = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -182,7 +191,8 @@ function claudeStream(prompt, options = {}, onEvent) {
       if (signal) {
         reject(Object.assign(new Error('Claude CLI was killed'), { signal, durationMs }));
       } else if (code !== 0) {
-        reject(Object.assign(new Error(stderr || `exit code ${code}`), { code, durationMs }));
+        const errDetail = [stderr, fullText].filter(Boolean).join('\n').trim() || `exit code ${code}`;
+        reject(Object.assign(new Error(errDetail), { code, durationMs }));
       } else {
         resolve({ markdown: fullText.trim(), durationMs });
       }
@@ -304,11 +314,11 @@ function createAgentCLIPool(opts = {}) {
    * Resolve project config into CLI options (cached).
    */
   function _resolve(agentFolder) {
-    const proj = projectManager.getProject(agentFolder);
-    const cliOptions = { cwd: proj.path };
+    const proj = projectManager.getAgent(agentFolder);
+    const cliOptions = { cwd: expandHome(proj.path) };
 
     if (proj.workDirs && proj.workDirs.length > 0) {
-      cliOptions.additionalDirs = [...proj.workDirs];
+      cliOptions.additionalDirs = proj.workDirs.map(expandHome);
     }
     if (proj.defaultModel) {
       cliOptions.model = proj.defaultModel;

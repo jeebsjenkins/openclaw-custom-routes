@@ -4,5 +4,6 @@
   "description": "{{description}}",
   "workDirs": [],
   "defaultModel": null,
-  "subscriptions": []
+  "subscriptions": [],
+  "heartbeat": null
 }
