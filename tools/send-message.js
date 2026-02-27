@@ -28,7 +28,7 @@ module.exports = {
   },
 
   async execute(input, context) {
-    const { messageBroker, agentId } = context;
+    const { messageBroker, agentId, sessionId } = context;
     if (!messageBroker) {
       return { output: 'messageBroker not available in context', isError: true };
     }
@@ -43,7 +43,10 @@ module.exports = {
       const isFullPath = knownPrefixes.some(p => input.to.startsWith(p)) || input.to.includes('/');
       const deliveryPath = isFullPath ? input.to : `agent/${input.to}`;
 
-      const result = messageBroker.route(agentId, deliveryPath, {
+      // Build from address: agent/{id}/session/{sid} when session is known
+      const fromAddr = sessionId ? `agent/${agentId}/session/${sessionId}` : (agentId || 'unknown');
+
+      const result = messageBroker.route(fromAddr, deliveryPath, {
         command: input.command || 'message',
         payload: input.payload || {},
         source: input.source || 'internal',

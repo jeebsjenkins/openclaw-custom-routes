@@ -17,6 +17,7 @@
   "license": "ISC",
   "dependencies": {
     "@noble/ed25519": "^3.0.0",
+    "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.14.1",
     "axios": "^1.13.5",
     "dotenv": "^17.3.1",

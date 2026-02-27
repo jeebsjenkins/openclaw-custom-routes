@@ -20,7 +20,7 @@
  * }
  *
  * Context passed to execute():
- * { agentId, projectRoot, log, messageBroker?, logScanner? }
+ * { agentId, sessionId?, projectRoot, log, messageBroker?, logScanner? }
  */
 
 const fs = require('fs');

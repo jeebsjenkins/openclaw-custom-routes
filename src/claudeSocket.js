@@ -249,7 +249,7 @@ function start(opts = {}) {
     });
 
     registerHandler('agent.tool.execute', (ws, msg) => {
-      const context = { messageBroker, logScanner };
+      const context = { messageBroker, logScanner, sessionId: msg.sessionId || null };
       toolLoader.executeTool(msg.agentId, msg.toolName, msg.input || {}, context)
         .then(result => {
           reply(ws, msg, { type: 'agent.tool.result', agentId: msg.agentId, toolName: msg.toolName, result });
