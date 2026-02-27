@@ -625,9 +625,16 @@ function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool, se
       }
     } catch { /* non-fatal — session may not exist yet */ }
 
-    // Inject three-tier memory context
+    // Inject CLAUDE.md chain + three-tier memory context
     try {
       const memoryParts = [];
+
+      // CLAUDE.md inheritance chain (root parent → child agent)
+      if (typeof projectManager.getClaudeMdChain === 'function') {
+        const claudeMdChain = projectManager.getClaudeMdChain(agentId);
+        if (claudeMdChain && claudeMdChain.trim()) memoryParts.push(`=== AGENT INSTRUCTIONS ===\n${claudeMdChain}`);
+      }
+
       const sysMem = projectManager.getSystemMemory();
       if (sysMem && sysMem.trim()) memoryParts.push(`=== SYSTEM CONTEXT ===\n${sysMem}`);
       const agentMem = projectManager.getAgentMemory(agentId);

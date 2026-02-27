@@ -254,17 +254,122 @@ function createAgentTurnManager(opts) {
     _startHeartbeats();
   }
 
+  // ─── Session Mapping ──────────────────────────────────────────────────────
+
+  /**
+   * Built-in session mappers that can be referenced by name in jvAgent.json.
+   *
+   * sessionMapper config in jvAgent.json:
+   *   "sessionMapper": "slack-thread"       ← map thread_ts to session
+   *   "sessionMapper": "work-item"          ← map workItemId to session
+   *   "sessionMapper": { "field": "payload.thread_ts", "prefix": "thread-" }
+   *
+   * The mapper returns a sessionId string or null (fall back to default).
+   */
+  const BUILTIN_MAPPERS = {
+    /**
+     * Slack thread mapper: uses payload.threadTs || payload.ts as session key.
+     * Creates sessions named "thread-{ts}" so each Slack thread is isolated.
+     */
+    'slack-thread': (routeResult) => {
+      const p = routeResult.payload || {};
+      const ts = p.threadTs || p.thread_ts || p.ts;
+      if (ts) return `thread-${ts}`;
+      return null;
+    },
+
+    /**
+     * Work-item mapper: uses payload.workItemId as session key.
+     * Creates sessions named "wi-{id}" for Azure DevOps work items.
+     */
+    'work-item': (routeResult) => {
+      const p = routeResult.payload || {};
+      const wiId = p.workItemId || p.work_item_id;
+      if (wiId) return `wi-${wiId}`;
+      return null;
+    },
+  };
+
+  /**
+   * Resolve a session mapper function for an agent.
+   * Returns null if no mapper is configured (uses default "main" session).
+   */
+  function _getSessionMapper(agentId) {
+    try {
+      const agent = projectManager.getAgent(agentId);
+      const mapperConfig = agent.sessionMapper;
+      if (!mapperConfig) return null;
+
+      // String reference to a built-in mapper
+      if (typeof mapperConfig === 'string') {
+        return BUILTIN_MAPPERS[mapperConfig] || null;
+      }
+
+      // Object config: { field: "payload.threadTs", prefix: "thread-" }
+      if (typeof mapperConfig === 'object' && mapperConfig.field) {
+        const { field, prefix = '' } = mapperConfig;
+        return (routeResult) => {
+          // Traverse nested field path like "payload.threadTs"
+          const parts = field.split('.');
+          let value = routeResult;
+          for (const part of parts) {
+            if (value == null) return null;
+            value = value[part];
+          }
+          if (value != null) return `${prefix}${value}`;
+          return null;
+        };
+      }
+    } catch { /* agent not found */ }
+    return null;
+  }
+
+  /**
+   * Derive the session ID for a routed message using the agent's sessionMapper.
+   * Falls back to the provided defaultSessionId if no mapper or no match.
+   * Auto-creates the session if it doesn't exist yet.
+   */
+  function _deriveSessionId(agentId, defaultSessionId, routeResult) {
+    const mapper = _getSessionMapper(agentId);
+    if (!mapper) return defaultSessionId;
+
+    const mappedId = mapper(routeResult);
+    if (!mappedId) return defaultSessionId;
+
+    // Auto-create the session if it doesn't exist
+    try {
+      projectManager.getSession(agentId, mappedId);
+    } catch {
+      try {
+        projectManager.createSession(agentId, mappedId, {
+          createdBy: 'sessionMapper',
+          mappedFrom: routeResult.source || 'unknown',
+          createdAt: Date.now(),
+        });
+        log.info(`[agentTurnManager] Auto-created session "${mappedId}" for agent "${agentId}"`);
+      } catch (err) {
+        log.warn(`[agentTurnManager] Failed to auto-create session "${mappedId}": ${err.message}`);
+        return defaultSessionId;
+      }
+    }
+
+    return mappedId;
+  }
+
   // ─── Delivery Handler ──────────────────────────────────────────────────────
 
   /**
    * Called when a message is delivered to a session (or to an agent's main session).
-   * Checks autoRun config and enqueues if enabled.
+   * Applies sessionMapper to derive the correct session, then checks autoRun and enqueues.
    */
   function _onSessionDelivery(agentId, sessionId, routeResult) {
-    const config = _resolveConfig(agentId, sessionId);
+    // Apply session mapper — may redirect from "main" to a specific session
+    const resolvedSessionId = _deriveSessionId(agentId, sessionId, routeResult);
+
+    const config = _resolveConfig(agentId, resolvedSessionId);
     if (!config.enabled) return;
 
-    _enqueue(agentId, sessionId, routeResult, config);
+    _enqueue(agentId, resolvedSessionId, routeResult, config);
   }
 
   /**
@@ -422,14 +527,38 @@ function createAgentTurnManager(opts) {
 
   /**
    * Build the triage prompt from agent context and inbound messages.
+   *
+   * Agents can customize triage via jvAgent.json:
+   *   "triagePrompt": "Custom instructions for when to accept/reject..."
+   *   "triageRules": { "alwaysAccept": ["slack.slash"], "alwaysReject": ["bot_message"] }
    */
   function _buildTriagePrompt(agentId, sessionId, messages) {
     let agentDescription = '';
+    let customTriagePrompt = '';
+    let triageRules = null;
     try {
       const agent = projectManager.getAgent(agentId);
       agentDescription = agent.description || agent.name || agentId;
+      customTriagePrompt = agent.triagePrompt || '';
+      triageRules = agent.triageRules || null;
     } catch {
       agentDescription = agentId;
+    }
+
+    // Fast-path: check triageRules for auto-accept/reject before building prompt
+    if (triageRules) {
+      const commands = messages.map(m => m.command);
+      const sources = messages.map(m => m.source);
+      const allTokens = [...commands, ...sources];
+
+      if (triageRules.alwaysAccept && triageRules.alwaysAccept.length > 0) {
+        const shouldAutoAccept = allTokens.some(t => triageRules.alwaysAccept.includes(t));
+        if (shouldAutoAccept) return null; // signal: auto-accept, skip LLM triage
+      }
+      if (triageRules.alwaysReject && triageRules.alwaysReject.length > 0) {
+        const shouldAutoReject = allTokens.every(t => triageRules.alwaysReject.includes(t));
+        if (shouldAutoReject) return ''; // signal: auto-reject
+      }
     }
 
     const messageSummary = messages.map((m, i) => {
@@ -441,6 +570,15 @@ function createAgentTurnManager(opts) {
       return parts.join('\n');
     }).join('\n');
 
+    const triageInstructions = customTriagePrompt
+      ? customTriagePrompt
+      : [
+          `Should this agent process these messages? Consider:`,
+          `- Does this match the agent's role/responsibilities?`,
+          `- Is this actionable (not just noise/status)?`,
+          `- Would the agent have something useful to do in response?`,
+        ].join('\n');
+
     return [
       `You are a message triage system. Decide if this agent should run a turn.`,
       ``,
@@ -451,10 +589,7 @@ function createAgentTurnManager(opts) {
       `Inbound messages (${messages.length}):`,
       messageSummary,
       ``,
-      `Should this agent process these messages? Consider:`,
-      `- Does this match the agent's role/responsibilities?`,
-      `- Is this actionable (not just noise/status)?`,
-      `- Would the agent have something useful to do in response?`,
+      triageInstructions,
       ``,
       `Reply with exactly YES or NO on the first line, then a brief reason.`,
     ].join('\n');
@@ -494,6 +629,19 @@ function createAgentTurnManager(opts) {
 
     const triagePrompt = _buildTriagePrompt(agentId, sessionId, messages);
 
+    // null → triageRules auto-accept (skip LLM triage)
+    if (triagePrompt === null) {
+      stats.triageAccepted++;
+      log.info(`[agentTurnManager] Turn ${turnId}: triage → auto-accept (triageRules)`);
+      return true;
+    }
+    // empty string → triageRules auto-reject
+    if (triagePrompt === '') {
+      stats.triageRejected++;
+      log.info(`[agentTurnManager] Turn ${turnId}: triage → auto-reject (triageRules)`);
+      return false;
+    }
+
     try {
       let text;
 
@@ -525,11 +673,23 @@ function createAgentTurnManager(opts) {
   // ─── Memory Assembly ─────────────────────────────────────────────────────
 
   /**
-   * Assemble the three-tier memory context for a turn.
+   * Assemble the multi-tier context for a turn.
+   * Includes: CLAUDE.md chain (parent→child) + system memory + agent memory + session memory.
    * Passed to the CLI via --system-prompt so it's separate from the user prompt.
    */
   function _assembleMemoryContext(agentId, sessionId) {
     const parts = [];
+
+    // CLAUDE.md inheritance chain (root parent → child agent)
+    // This gives nested agents like impl/acme their parent's product knowledge
+    try {
+      if (typeof projectManager.getClaudeMdChain === 'function') {
+        const claudeMdChain = projectManager.getClaudeMdChain(agentId);
+        if (claudeMdChain && claudeMdChain.trim()) {
+          parts.push(`=== AGENT INSTRUCTIONS ===\n${claudeMdChain}`);
+        }
+      }
+    } catch { /* non-fatal */ }
 
     // System memory (project-wide)
     try {
@@ -617,6 +777,10 @@ function createAgentTurnManager(opts) {
       if (memoryContext) {
         cliOptions.systemPrompt = memoryContext;
       }
+
+      // Agent secrets are already cached in the CLI pool options (from _resolve),
+      // but we can also inject them explicitly for auto-turn execution.
+      // The agentCLIPool's merged options will include them automatically.
 
       // Include session directory as an additional dir
       try {

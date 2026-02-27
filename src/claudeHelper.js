@@ -89,12 +89,16 @@ function claudeStream(prompt, options = {}, onEvent) {
   const args = ['-p', '--verbose', '--output-format', 'stream-json', ...buildCommonArgs(options)];
   args.push(prompt);
 
+  // Clean env: strip Claude Code internal vars. Secrets are NOT injected here —
+  // they flow through toolLoader's executeTool() context so the LLM never sees them.
+  const env = cleanEnv();
+
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const proc = spawn('claude', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: cleanEnv(),
+      env,
     });
 
     let fullText = '';
@@ -221,12 +225,15 @@ function claudeQuery(prompt, options = {}) {
   const args = ['-p', '--verbose', '--output-format', 'json', ...buildCommonArgs(options)];
   args.push(prompt);
 
+  // Clean env only — no secrets in subprocess. Tools get secrets via context.agentSecrets.
+  const env = cleanEnv();
+
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const proc = spawn('claude', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: cleanEnv(),
+      env,
     });
 
     let stdout = '';
@@ -312,6 +319,7 @@ function createAgentCLIPool(opts = {}) {
 
   /**
    * Resolve project config into CLI options (cached).
+   * Includes agent secrets so they're available to stream()/query() calls.
    */
   function _resolve(agentFolder) {
     const proj = projectManager.getAgent(agentFolder);
@@ -323,6 +331,10 @@ function createAgentCLIPool(opts = {}) {
     if (proj.defaultModel) {
       cliOptions.model = proj.defaultModel;
     }
+
+    // NOTE: Agent secrets are NOT loaded here. They flow exclusively through
+    // toolLoader.executeTool() → context.agentSecrets so the LLM subprocess
+    // never has access to tokens/keys in its environment.
 
     return cliOptions;
   }

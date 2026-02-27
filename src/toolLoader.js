@@ -4,9 +4,14 @@
  * Loosely coupled: depends only on Node.js fs/path. No express, ws, or other project deps.
  * Can be extracted to a standalone project by copying this file.
  *
- * Tools are loaded from two locations (agent-local overrides global):
- *   1. PROJECT_ROOT/tools/          — global tools available to all agents
- *   2. PROJECT_ROOT/<agent>/tools/  — agent-specific tools
+ * Tools are loaded with hierarchical inheritance:
+ *   1. PROJECT_ROOT/tools/                 — global tools (lowest priority)
+ *   2. PROJECT_ROOT/{parent}/tools/        — parent agent tools (for nested agents)
+ *   3. PROJECT_ROOT/{parent}/{child}/tools/ — agent-local tools (highest priority)
+ *
+ * For a nested agent like "impl/acme", tool resolution order is:
+ *   tools/ → impl/tools/ → impl/acme/tools/
+ * Tools with the same name at a more specific level override parent tools.
  *
  * Tool contract (each .js file must export):
  * {
@@ -20,7 +25,7 @@
  * }
  *
  * Context passed to execute():
- * { agentId, sessionId?, projectRoot, log, messageBroker?, logScanner? }
+ * { agentId, sessionId?, agentConfig?, agentSecrets?, projectRoot, log, messageBroker?, logScanner? }
  */
 
 const fs = require('fs');
@@ -31,12 +36,16 @@ const path = require('path');
  *
  * @param {string} projectRoot - Absolute path to the root directory
  * @param {object} [log] - Logger with info/warn/error methods
+ * @param {object} [opts] - Optional dependencies
+ * @param {object} [opts.projectManager] - ProjectManager instance (for secrets + config injection)
  * @returns {object} ToolLoader API
  */
-function createToolLoader(projectRoot, log = console) {
+function createToolLoader(projectRoot, log = console, opts = {}) {
   if (!projectRoot) {
     throw new Error('toolLoader: projectRoot is required');
   }
+
+  const { projectManager } = opts;
 
   // Cache: Map<cacheKey, Map<toolName, toolExport>>
   const cache = new Map();
@@ -96,25 +105,43 @@ function createToolLoader(projectRoot, log = console) {
   }
 
   /**
+   * Build the ordered list of tool directories for an agent.
+   * Walks the path hierarchy from global → parent → agent.
+   * More specific directories override less specific ones.
+   *
+   * For "impl/acme": [tools/, impl/tools/, impl/acme/tools/]
+   */
+  function _getToolDirs(agentId) {
+    const dirs = [];
+
+    // 1. Global tools (lowest priority)
+    dirs.push(path.join(projectRoot, 'tools'));
+
+    // 2. Walk parent hierarchy (for nested agents)
+    if (agentId) {
+      const parts = agentId.split('/');
+      for (let i = 1; i <= parts.length; i++) {
+        dirs.push(path.join(projectRoot, parts.slice(0, i).join('/'), 'tools'));
+      }
+    }
+
+    return dirs;
+  }
+
+  /**
    * Discover and load all tools available to an agent.
-   * Priority: agent-local tools override global tools of the same name.
+   * Uses hierarchical inheritance: global → parent → agent-local.
+   * More specific tools override less specific ones with the same name.
    *
    * @param {string} agentId - Agent path ID
    * @returns {Map<string, object>} Map of toolName → toolExport
    */
   function loadAgentTools(agentId) {
     const tools = new Map();
+    const dirs = _getToolDirs(agentId);
 
-    // 1. Load global tools
-    const globalDir = path.join(projectRoot, 'tools');
-    for (const [name, tool] of _scanToolDir(globalDir)) {
-      tools.set(name, tool);
-    }
-
-    // 2. Load agent-local tools (override global)
-    if (agentId) {
-      const agentToolsDir = path.join(projectRoot, agentId, 'tools');
-      for (const [name, tool] of _scanToolDir(agentToolsDir)) {
+    for (const dir of dirs) {
+      for (const [name, tool] of _scanToolDir(dir)) {
         tools.set(name, tool);
       }
     }
@@ -171,12 +198,19 @@ function createToolLoader(projectRoot, log = console) {
       throw new Error(`Tool not found: ${toolName} (agent: ${agentId})`);
     }
 
+    // Build enriched context with secrets and config
     const fullContext = {
       agentId,
       projectRoot,
       log,
       ...context,
     };
+
+    // Inject per-agent secrets and raw config if projectManager is available
+    if (projectManager) {
+      try { fullContext.agentSecrets = projectManager.getAgentSecrets(agentId); } catch { /* non-fatal */ }
+      try { fullContext.agentConfig = projectManager.getAgentConfigRaw(agentId); } catch { /* non-fatal */ }
+    }
 
     return tool.execute(input, fullContext);
   }

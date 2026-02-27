@@ -553,6 +553,69 @@ function createProjectManager(projectRoot) {
     fs.writeFileSync(path.join(memDir, 'notes.md'), content);
   }
 
+  // ─── Secrets ────────────────────────────────────────────────────────────
+  // Per-agent secrets stored in {agentDir}/secrets.env (NOT version-controlled).
+
+  /**
+   * Read per-agent secrets from secrets.env.
+   * Returns a plain object of key=value pairs.
+   * Does NOT inherit from parent agents — each agent has its own isolated secrets.
+   *
+   * @param {string} agentId
+   * @returns {object} Key/value map (empty if no secrets.env)
+   */
+  function getAgentSecrets(agentId) {
+    const secretsPath = path.join(_agentDir(agentId), 'secrets.env');
+    if (!fs.existsSync(secretsPath)) return {};
+
+    const raw = fs.readFileSync(secretsPath, 'utf8');
+    const secrets = {};
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      secrets[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+    }
+    return secrets;
+  }
+
+  /**
+   * Get the raw jvAgent.json config for an agent (all fields, no transformation).
+   * Useful for passing custom config blocks (devops, git, instance) to tools.
+   *
+   * @param {string} agentId
+   * @returns {object} Raw config or empty object
+   */
+  function getAgentConfigRaw(agentId) {
+    const configPath = path.join(_agentDir(agentId), 'jvAgent.json');
+    try {
+      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Get assembled CLAUDE.md for a nested agent, including parent hierarchy.
+   * For "impl/acme", concatenates: impl/CLAUDE.md + impl/acme/CLAUDE.md.
+   *
+   * @param {string} agentId
+   * @returns {string} Combined CLAUDE.md content
+   */
+  function getClaudeMdChain(agentId) {
+    const parts = agentId.split('/');
+    const chain = [];
+
+    for (let i = 1; i <= parts.length; i++) {
+      const ancestorId = parts.slice(0, i).join('/');
+      const md = getClaudeMd(ancestorId);
+      if (md.trim()) chain.push(md);
+    }
+
+    return chain.join('\n\n---\n\n');
+  }
+
   // ─── Helpers ────────────────────────────────────────────────────────────
 
   /**
@@ -627,6 +690,11 @@ function createProjectManager(projectRoot) {
     updateAgentMemory,
     getSessionMemory,
     updateSessionMemory,
+
+    // Secrets & config
+    getAgentSecrets,
+    getAgentConfigRaw,
+    getClaudeMdChain,
   };
 }
 

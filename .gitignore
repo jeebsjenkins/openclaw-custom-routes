@@ -4,4 +4,6 @@ node_modules/
 log/
 workspace/
 .env
+secrets.env
+**/secrets.env
 

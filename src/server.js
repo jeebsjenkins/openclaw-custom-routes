@@ -123,7 +123,7 @@ async function start() {
     try {
       const projectManager = createProjectManager(config.projectRoot);
       const agentCLIPool = createAgentCLIPool({ projectManager, log });
-      const toolLoader = createToolLoader(config.projectRoot, log);
+      const toolLoader = createToolLoader(config.projectRoot, log, { projectManager });
       const messageBroker = createMessageBroker(config.projectRoot, projectManager, log);
       const logScanner = createLogScanner(config.projectRoot, projectManager.listAgents, log);
       // Create Anthropic API client for lightweight triage (optional — falls back to CLI)
