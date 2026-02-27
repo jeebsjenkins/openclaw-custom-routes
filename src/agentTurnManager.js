@@ -43,6 +43,7 @@
  */
 
 const crypto = require('crypto');
+const cron = require('node-cron');
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -95,6 +96,9 @@ function createAgentTurnManager(opts) {
   // Pending re-runs: "agentId:sessionId" → messages[] (queued during active turn)
   const pendingRerun = new Map();
 
+  // Heartbeat scheduled jobs: agentId → cron.ScheduledTask
+  const heartbeatJobs = new Map();
+
   // Stats tracking
   const stats = {
     triageCount: 0,
@@ -112,7 +116,7 @@ function createAgentTurnManager(opts) {
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   /**
-   * Start watching broker deliveries.
+   * Start watching broker deliveries and heartbeat schedules.
    */
   function start() {
     if (unhookRoute) return; // already started
@@ -135,7 +139,10 @@ function createAgentTurnManager(opts) {
       }
     });
 
-    log.info('[agentTurnManager] Started — watching broker deliveries');
+    // Start heartbeat schedules for all agents
+    _startHeartbeats();
+
+    log.info('[agentTurnManager] Started — watching broker deliveries + heartbeats');
   }
 
   /**
@@ -154,7 +161,97 @@ function createAgentTurnManager(opts) {
     debounceQueues.clear();
     pendingRerun.clear();
 
+    // Stop all heartbeat jobs
+    _stopHeartbeats();
+
     log.info('[agentTurnManager] Stopped');
+  }
+
+  // ─── Heartbeat / CRON ─────────────────────────────────────────────────────
+
+  /**
+   * Scan all agents for heartbeat cron config and schedule jobs.
+   */
+  function _startHeartbeats() {
+    let agents;
+    try {
+      agents = projectManager.listAgents();
+    } catch (err) {
+      log.warn(`[agentTurnManager] Could not list agents for heartbeat scan: ${err.message}`);
+      return;
+    }
+
+    for (const agent of agents) {
+      _scheduleHeartbeat(agent);
+    }
+  }
+
+  /**
+   * Schedule a heartbeat for a single agent (if configured).
+   */
+  function _scheduleHeartbeat(agent) {
+    const agentId = agent.id || agent.name;
+    const heartbeatCron = agent.heartbeat;
+
+    if (!heartbeatCron || typeof heartbeatCron !== 'string') return;
+
+    if (!cron.validate(heartbeatCron)) {
+      log.warn(`[agentTurnManager] Invalid heartbeat cron for agent "${agentId}": ${heartbeatCron}`);
+      return;
+    }
+
+    // Stop existing job if any
+    if (heartbeatJobs.has(agentId)) {
+      heartbeatJobs.get(agentId).stop();
+    }
+
+    const job = cron.schedule(heartbeatCron, () => {
+      _fireHeartbeat(agentId, heartbeatCron);
+    });
+
+    heartbeatJobs.set(agentId, job);
+    log.info(`[agentTurnManager] Scheduled heartbeat for "${agentId}": ${heartbeatCron}`);
+  }
+
+  /**
+   * Fire a heartbeat turn for an agent by routing a synthetic message through the broker.
+   */
+  function _fireHeartbeat(agentId, cronExpr) {
+    log.info(`[agentTurnManager] Heartbeat firing for "${agentId}"`);
+
+    try {
+      messageBroker.route('system/heartbeat', `agent/${agentId}`, {
+        command: 'heartbeat',
+        payload: {
+          scheduled: true,
+          cron: cronExpr,
+          firedAt: new Date().toISOString(),
+        },
+        source: 'heartbeat',
+      });
+    } catch (err) {
+      log.error(`[agentTurnManager] Heartbeat route failed for "${agentId}": ${err.message}`);
+    }
+  }
+
+  /**
+   * Stop all heartbeat jobs.
+   */
+  function _stopHeartbeats() {
+    for (const [agentId, job] of heartbeatJobs) {
+      job.stop();
+      log.info(`[agentTurnManager] Stopped heartbeat for "${agentId}"`);
+    }
+    heartbeatJobs.clear();
+  }
+
+  /**
+   * Re-scan agents and update heartbeat schedules.
+   * Call this when agent configs change at runtime.
+   */
+  function refreshHeartbeats() {
+    _stopHeartbeats();
+    _startHeartbeats();
   }
 
   // ─── Delivery Handler ──────────────────────────────────────────────────────
@@ -485,16 +582,27 @@ function createAgentTurnManager(opts) {
       return `${header}\n${meta.join('\n')}${payload}`;
     }).join('\n\n');
 
-    const prompt = [
-      `You have ${messages.length} new inbound message(s) to process:`,
-      ``,
-      messageBlocks,
-      ``,
-      `Process these messages according to your role and instructions.`,
-      `Use your available tools to take action as needed.`,
-      `If a message requires a reply, use the send-message tool.`,
-      `Update your memory/notes.md if you learn anything important.`,
-    ].join('\n');
+    // Detect heartbeat-only turns for a tailored prompt
+    const isHeartbeat = messages.length === 1 && messages[0].command === 'heartbeat' && messages[0].source === 'heartbeat';
+
+    const prompt = isHeartbeat
+      ? [
+          `This is a scheduled heartbeat. You are being activated on a CRON schedule.`,
+          ``,
+          `Check your memory/notes.md for active tasks, review any pending items,`,
+          `and take action as needed. If there's nothing to do, briefly note that`,
+          `in your session memory and exit.`,
+        ].join('\n')
+      : [
+          `You have ${messages.length} new inbound message(s) to process:`,
+          ``,
+          messageBlocks,
+          ``,
+          `Process these messages according to your role and instructions.`,
+          `Use your available tools to take action as needed.`,
+          `If a message requires a reply, use the send-message tool.`,
+          `Update your memory/notes.md if you learn anything important.`,
+        ].join('\n');
 
     try {
       const cli = agentCLIPool.getAgentCLI(agentId);
@@ -601,6 +709,7 @@ function createAgentTurnManager(opts) {
     start,
     stop,
     triggerTurn,
+    refreshHeartbeats,
     getStats,
     isActive,
 

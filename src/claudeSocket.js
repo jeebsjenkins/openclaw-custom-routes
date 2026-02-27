@@ -586,24 +586,61 @@ function start(opts = {}) {
 /**
  * Resolve CLI options for an agent — uses the agentCLIPool if available,
  * otherwise falls back to reading agent config directly.
+ *
+ * When a sessionId is provided, also merges:
+ *   - Session directory as an additionalDir
+ *   - Session-level workDirs as additionalDirs
+ *   - Three-tier memory context as systemPrompt
  */
-function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool) {
+function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool, sessionId) {
   if (!agentId || !projectManager) return { ...options };
+
+  let cliOptions;
 
   if (agentCLIPool) {
     const agent = agentCLIPool.getAgentCLI(agentId);
-    return { ...agent.options, ...options };
+    cliOptions = { ...agent.options, ...options };
+  } else {
+    // Fallback: resolve directly
+    const agent = projectManager.getAgent(agentId);
+    cliOptions = { ...options, cwd: expandHome(agent.path) };
+    if (agent.workDirs && agent.workDirs.length > 0) {
+      cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...agent.workDirs.map(expandHome)];
+    }
+    if (agent.defaultModel && !cliOptions.model) {
+      cliOptions.model = agent.defaultModel;
+    }
   }
 
-  // Fallback: resolve directly
-  const agent = projectManager.getAgent(agentId);
-  const cliOptions = { ...options, cwd: expandHome(agent.path) };
-  if (agent.workDirs && agent.workDirs.length > 0) {
-    cliOptions.additionalDirs = [...(cliOptions.additionalDirs || []), ...agent.workDirs.map(expandHome)];
+  // Merge session-level directories + workDirs
+  if (sessionId && projectManager) {
+    try {
+      const sessionDir = projectManager.getSessionDir(agentId, sessionId);
+      if (!cliOptions.additionalDirs) cliOptions.additionalDirs = [];
+      cliOptions.additionalDirs.push(sessionDir);
+
+      const session = projectManager.getSession(agentId, sessionId);
+      if (session && session.workDirs && session.workDirs.length > 0) {
+        cliOptions.additionalDirs.push(...session.workDirs.map(expandHome));
+      }
+    } catch { /* non-fatal — session may not exist yet */ }
+
+    // Inject three-tier memory context
+    try {
+      const memoryParts = [];
+      const sysMem = projectManager.getSystemMemory();
+      if (sysMem && sysMem.trim()) memoryParts.push(`=== SYSTEM CONTEXT ===\n${sysMem}`);
+      const agentMem = projectManager.getAgentMemory(agentId);
+      if (agentMem && agentMem.trim()) memoryParts.push(`=== AGENT MEMORY ===\n${agentMem}`);
+      const sessMem = projectManager.getSessionMemory(agentId, sessionId);
+      if (sessMem && sessMem.trim()) memoryParts.push(`=== SESSION MEMORY ===\n${sessMem}`);
+
+      if (memoryParts.length > 0) {
+        cliOptions.systemPrompt = memoryParts.join('\n\n');
+      }
+    } catch { /* non-fatal */ }
   }
-  if (agent.defaultModel && !cliOptions.model) {
-    cliOptions.model = agent.defaultModel;
-  }
+
   return cliOptions;
 }
 
@@ -618,7 +655,7 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPoo
 
   let cliOptions;
   try {
-    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool);
+    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId);
   } catch (err) {
     reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
@@ -644,7 +681,7 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
 
   let cliOptions;
   try {
-    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool);
+    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId);
   } catch (err) {
     reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;

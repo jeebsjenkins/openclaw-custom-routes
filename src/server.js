@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const express = require('express');
 const config = require('../config');
 const RouteLoader = require('./loader');
@@ -13,6 +14,7 @@ const { createMessageBroker } = require('./messageBroker');
 const { createLogScanner } = require('./logScanner');
 const { createAgentTurnManager } = require('./agentTurnManager');
 const { createAnthropicClient } = require('./anthropicHelper');
+const { createServiceLoader } = require('./serviceLoader');
 
 // --- File logger ---
 const logDir = path.join(__dirname, '..', 'log');
@@ -141,6 +143,22 @@ async function start() {
         log,
       });
       turnManager.start();
+
+      // Start service loader (auto-discovers services/ directory)
+      const expandedRoot = config.projectRoot.startsWith('~/')
+        ? path.join(os.homedir(), config.projectRoot.slice(1))
+        : config.projectRoot;
+      const servicesDir = path.join(expandedRoot, 'services');
+      const serviceLoader = createServiceLoader(servicesDir, log);
+      serviceLoader.startAll({
+        messageBroker,
+        projectManager,
+        agentCLIPool,
+        turnManager,
+        log,
+        config,
+      });
+      log.info(`Services directory: ${servicesDir}`);
 
       log.info(`Project root: ${config.projectRoot}`);
       claudeSocket.start({
