@@ -150,14 +150,19 @@ async function start() {
         : config.projectRoot;
       const servicesDir = path.join(expandedRoot, 'services');
       const serviceLoader = createServiceLoader(servicesDir, log);
-      serviceLoader.startAll({
+      const serviceContext = {
         messageBroker,
         projectManager,
         agentCLIPool,
         turnManager,
         log,
         config,
-      });
+      };
+      serviceLoader.startAll(serviceContext);
+
+      // Give toolLoader access to serviceLoader so the service-status tool works
+      toolLoader.setServiceLoader(serviceLoader);
+
       log.info(`Services directory: ${servicesDir}`);
 
       log.info(`Project root: ${config.projectRoot}`);
@@ -171,6 +176,7 @@ async function start() {
         toolLoader,
         messageBroker,
         logScanner,
+        anthropicClient,
         log,
       });
     } catch (err) {

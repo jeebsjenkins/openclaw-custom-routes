@@ -32,6 +32,12 @@
  *   { type: "agent.tools.refresh", agentId? }
  *   { type: "agent.tool.execute", agentId, toolName, input }
  *
+ * ── Ask-User (interactive tool ↔ dashboard) ─────────────────────────
+ * Server → Client:
+ *   { type: "ask-user", questionId, agentId, sessionId, question, options?, context? }
+ * Client → Server:
+ *   { type: "ask-user.response", questionId, answer }
+ *
  * ── Unified Messaging (msg.*) ────────────────────────────────────────
  *   { type: "msg.send", from, to, command, payload }
  *   { type: "msg.route", from, path, source, externalId?, command?, payload }
@@ -72,6 +78,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const os = require('os');
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
@@ -101,6 +108,7 @@ const HEARTBEAT_INTERVAL_MS = 30000;
  * @param {object}   [opts.messageBroker] - MessageBroker instance (unified messaging)
  * @param {object}   [opts.logScanner]    - LogScanner instance
  * @param {object}   [opts.agentCLIPool]  - AgentCLIPool instance
+ * @param {object}   [opts.anthropicClient] - Anthropic API client (for triage/title generation)
  * @param {object}   [opts.log]           - Logger with info/warn/error methods
  * @returns {{ wss: WebSocketServer, close: () => void }}
  */
@@ -115,6 +123,7 @@ function start(opts = {}) {
     messageBroker,
     logScanner,
     agentCLIPool,
+    anthropicClient,
     log = console,
   } = opts;
 
@@ -127,6 +136,118 @@ function start(opts = {}) {
 
   function registerHandler(type, fn) {
     handlers[type] = fn;
+  }
+
+  function _safeReadJSON(filePath, fallback) {
+    try {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      return fallback;
+    }
+  }
+
+  function _safeWriteJSON(filePath, value) {
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+    } catch { /* non-fatal */ }
+  }
+
+  // ─── Pending user questions (ask-user tool) ────────────────────────────
+  //
+  // When an agent calls the ask-user tool, the question is stored here and
+  // pushed to all connected dashboard clients. When a client responds, the
+  // corresponding promise is resolved and the tool returns the answer.
+
+  const pendingQuestions = new Map(); // questionId → { resolve, reject, timer, agentId, sessionId }
+  const ASK_USER_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for user to respond
+  const ASK_USER_INDEX_FILE = path.join(os.tmpdir(), 'openclaw-ask-user-index.json');
+  const askUserIndex = _safeReadJSON(ASK_USER_INDEX_FILE, {}); // questionId → metadata
+
+  function _persistAskUserIndex() {
+    _safeWriteJSON(ASK_USER_INDEX_FILE, askUserIndex);
+  }
+
+  function _lateAnswersFile(agentId, sessionId) {
+    if (!projectManager || !agentId || !sessionId) return null;
+    try {
+      const sessionDir = projectManager.getSessionDir(agentId, sessionId);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      return path.join(sessionDir, 'ask-user-late-answers.json');
+    } catch {
+      return null;
+    }
+  }
+
+  function _queueLateAnswer({ questionId, agentId, sessionId, question, answer }) {
+    const filePath = _lateAnswersFile(agentId, sessionId);
+    if (!filePath) return false;
+    const list = _safeReadJSON(filePath, []);
+    list.push({
+      questionId,
+      question: question || null,
+      answer,
+      answeredAt: Date.now(),
+    });
+    // Keep only recent entries to avoid unbounded growth.
+    while (list.length > 50) list.shift();
+    _safeWriteJSON(filePath, list);
+    return true;
+  }
+
+  /**
+   * Create an askUser function bound to a specific session context.
+   * This is injected into the tool execution context so the ask-user
+   * tool can push questions to the dashboard and wait for answers.
+   */
+  function createAskUser(agentId, sessionId) {
+    return function askUser({ question, options, context: ctx }) {
+      return new Promise((resolve, reject) => {
+        const questionId = crypto.randomUUID();
+
+        const timer = setTimeout(() => {
+          pendingQuestions.delete(questionId);
+          if (askUserIndex[questionId]) {
+            askUserIndex[questionId].status = 'timed_out';
+            askUserIndex[questionId].timedOutAt = Date.now();
+            _persistAskUserIndex();
+          }
+          reject(new Error('User response timeout (5 minutes)'));
+        }, ASK_USER_TIMEOUT_MS);
+
+        pendingQuestions.set(questionId, { resolve, reject, timer, agentId, sessionId });
+        askUserIndex[questionId] = {
+          questionId,
+          agentId: agentId || null,
+          sessionId: sessionId || null,
+          question,
+          options: options || null,
+          context: ctx || null,
+          createdAt: Date.now(),
+          status: 'pending',
+        };
+        _persistAskUserIndex();
+
+        // Push to all authenticated clients
+        const payload = {
+          type: 'ask-user',
+          questionId,
+          agentId,
+          sessionId,
+          question,
+          options: options || null,
+          context: ctx || null,
+        };
+
+        for (const client of wss.clients) {
+          if (client._csAuthed && client.readyState === client.OPEN) {
+            sendJSON(client, payload);
+          }
+        }
+
+        log.info(`[claudeSocket] ask-user question pushed: ${questionId} — "${question}"`);
+      });
+    };
   }
 
   // ─── Register built-in handlers ─────────────────────────────────────────
@@ -223,8 +344,8 @@ function start(opts = {}) {
   }
 
   // Session start/continue/abort always registered
-  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
-  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log));
+  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log));
+  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log));
   registerHandler('session.abort', (ws, msg) => handleSessionAbort(ws, msg, log));
 
   // ─── Tool handlers ──────────────────────────────────────────────────────
@@ -249,7 +370,12 @@ function start(opts = {}) {
     });
 
     registerHandler('agent.tool.execute', (ws, msg) => {
-      const context = { messageBroker, logScanner, sessionId: msg.sessionId || null };
+      const context = {
+        messageBroker,
+        logScanner,
+        sessionId: msg.sessionId || null,
+        askUser: createAskUser(msg.agentId, msg.sessionId || null),
+      };
       toolLoader.executeTool(msg.agentId, msg.toolName, msg.input || {}, context)
         .then(result => {
           reply(ws, msg, { type: 'agent.tool.result', agentId: msg.agentId, toolName: msg.toolName, result });
@@ -259,6 +385,70 @@ function start(opts = {}) {
         });
     });
   }
+
+  // ─── Ask-user response handler ────────────────────────────────────────
+  //
+  // Dashboard clients send this when the user answers a question from the
+  // ask-user tool. The questionId correlates to a pending promise.
+
+  registerHandler('ask-user.response', (ws, msg) => {
+    const pending = pendingQuestions.get(msg.questionId);
+    if (!pending) {
+      const meta = askUserIndex[msg.questionId];
+      if (!meta || !meta.agentId || !meta.sessionId) {
+        reply(ws, msg, { type: 'ask-user.response.error', error: 'No pending question with that ID (may have timed out)' });
+        return;
+      }
+
+      const queued = _queueLateAnswer({
+        questionId: msg.questionId,
+        agentId: meta.agentId,
+        sessionId: meta.sessionId,
+        question: meta.question,
+        answer: msg.answer,
+      });
+
+      if (queued) {
+        meta.status = 'answered_late';
+        meta.answeredAt = Date.now();
+        _persistAskUserIndex();
+
+        try {
+          projectManager.appendConversationLog(meta.agentId, meta.sessionId, {
+            role: 'user',
+            type: 'ask-user.response.late',
+            text: typeof msg.answer === 'string' ? msg.answer : JSON.stringify(msg.answer),
+            questionId: msg.questionId,
+            question: meta.question || '',
+          });
+        } catch { /* non-fatal */ }
+
+        log.info(`[claudeSocket] ask-user late response queued: ${msg.questionId} — "${String(msg.answer).slice(0, 100)}"`);
+        reply(ws, msg, {
+          type: 'ask-user.response.ok',
+          questionId: msg.questionId,
+          queuedForSession: true,
+          agentId: meta.agentId,
+          sessionId: meta.sessionId,
+        });
+      } else {
+        reply(ws, msg, { type: 'ask-user.response.error', error: 'Failed to queue late answer' });
+      }
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    pendingQuestions.delete(msg.questionId);
+    pending.resolve(msg.answer);
+    if (askUserIndex[msg.questionId]) {
+      askUserIndex[msg.questionId].status = 'answered';
+      askUserIndex[msg.questionId].answeredAt = Date.now();
+      _persistAskUserIndex();
+    }
+
+    log.info(`[claudeSocket] ask-user response received: ${msg.questionId} — "${String(msg.answer).slice(0, 100)}"`);
+    reply(ws, msg, { type: 'ask-user.response.ok', questionId: msg.questionId });
+  });
 
   // ─── Unified message broker handlers (msg.*) ──────────────────────────
 
@@ -591,11 +781,13 @@ function start(opts = {}) {
  *   - Session directory as an additionalDir
  *   - Session-level workDirs as additionalDirs
  *   - Three-tier memory context as systemPrompt
+ *   - Available tool documentation (if toolLoader provided)
  */
-function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool, sessionId) {
+function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool, sessionId, toolLoader, log = console) {
   if (!agentId || !projectManager) return { ...options };
 
   let cliOptions;
+  let hasAskUserTool = false;
 
   if (agentCLIPool) {
     const agent = agentCLIPool.getAgentCLI(agentId);
@@ -642,16 +834,193 @@ function _resolveAgentOptions(agentId, options, projectManager, agentCLIPool, se
       const sessMem = projectManager.getSessionMemory(agentId, sessionId);
       if (sessMem && sessMem.trim()) memoryParts.push(`=== SESSION MEMORY ===\n${sessMem}`);
 
+      // Inject available tool documentation so the agent knows what tools exist
+      if (toolLoader) {
+        try {
+          const tools = toolLoader.listAgentTools(agentId);
+          log.info(`[_resolveAgentOptions] Found ${tools.length} tools for agent "${agentId}": ${tools.map(t => t.name).join(', ')}`);
+          const toolDocs = _buildToolDocs(agentId, toolLoader, tools);
+          if (toolDocs) memoryParts.push(toolDocs);
+
+          // If our ask-user tool exists, block the built-in AskUserQuestion
+          // so the CLI agent uses our dashboard-connected version instead.
+          hasAskUserTool = tools.some(t => t.name === 'ask-user');
+          if (hasAskUserTool) {
+            if (!cliOptions.disallowedTools) cliOptions.disallowedTools = [];
+            cliOptions.disallowedTools.push('AskUserQuestion');
+            log.info('[_resolveAgentOptions] Blocking built-in AskUserQuestion — ask-user tool found');
+          }
+        } catch (err) {
+          log.error(`[_resolveAgentOptions] Tool injection error: ${err.message}`);
+        }
+      }
+
       if (memoryParts.length > 0) {
         cliOptions.systemPrompt = memoryParts.join('\n\n');
       }
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      log.error(`[_resolveAgentOptions] Memory/context injection error: ${err.message}`);
+    }
   }
 
+  // Always block built-in interactive question tool for socket sessions.
+  // The intended interaction path is the dashboard ask-user flow.
+  cliOptions.disallowedTools = [].concat(cliOptions.disallowedTools || []);
+  if (!cliOptions.disallowedTools.includes('AskUserQuestion')) {
+    cliOptions.disallowedTools.push('AskUserQuestion');
+    log.info('[_resolveAgentOptions] Blocking AskUserQuestion (session default)');
+  }
+
+  // If ask-user is available and caller did not explicitly choose a permission
+  // mode, default to bypassPermissions so Bash can execute tool-cli ask-user
+  // without stalling on approval prompts.
+  if (!cliOptions.permissionMode && hasAskUserTool) {
+    cliOptions.permissionMode = 'bypassPermissions';
+    log.info('[_resolveAgentOptions] Setting permissionMode=bypassPermissions (ask-user default)');
+  }
+
+  log.info(`[_resolveAgentOptions] Final disallowedTools: ${JSON.stringify(cliOptions.disallowedTools || [])}`);
   return cliOptions;
 }
 
-function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log) {
+/**
+ * Build tool documentation string for injection into the system prompt.
+ * Tells the agent what tools are available and how to call them via Bash.
+ */
+function _buildToolDocs(agentId, toolLoader, tools) {
+  if (!tools) tools = toolLoader.listAgentTools(agentId);
+  if (!tools || tools.length === 0) return null;
+
+  const toolCliPath = path.join(__dirname, 'tool-cli.js');
+
+  const lines = [
+    '=== AVAILABLE TOOLS ===',
+    '',
+    'You have access to the following server-side tools via the tool-cli bridge.',
+    'Call them using Bash. Secrets (API keys, tokens) are injected server-side — you never need to provide them.',
+    '',
+    'Your agent ID and session ID are automatically available in the environment',
+    '(TOOL_AGENT_ID, TOOL_SESSION_ID). You do NOT need to pass --agent or --session;',
+    'the tool-cli reads them from the environment by default.',
+    '',
+    'IMPORTANT: When you need to ask the user a question or get input, use the ask-user tool via Bash (shown below).',
+    'Do NOT use the built-in AskUserQuestion tool — it is disabled. Use ask-user instead.',
+    '',
+    'Usage:',
+    `  node ${toolCliPath} <tool-name> --input '<json>'`,
+    `  node ${toolCliPath} list`,
+    '',
+  ];
+
+  for (const tool of tools) {
+    lines.push(`### ${tool.name}`);
+    if (tool.description) lines.push(tool.description);
+
+    if (tool.schema && tool.schema.properties) {
+      const props = Object.entries(tool.schema.properties);
+      if (props.length > 0) {
+        lines.push('Parameters:');
+        for (const [key, val] of props) {
+          const req = (tool.schema.required || []).includes(key) ? ' (required)' : '';
+          const desc = val.description ? ` — ${val.description}` : '';
+          const enumVals = val.enum ? ` [${val.enum.join('|')}]` : '';
+          lines.push(`  ${key}: ${val.type || 'any'}${enumVals}${req}${desc}`);
+        }
+      }
+    }
+
+    // Example invocation
+    const exampleInput = _buildExampleInput(tool);
+    lines.push(`Example: node ${toolCliPath} ${tool.name} --input '${JSON.stringify(exampleInput)}'`);
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Build a minimal example input object from a tool's schema.
+ */
+function _buildExampleInput(tool) {
+  if (!tool.schema || !tool.schema.properties) return {};
+  const example = {};
+  const required = tool.schema.required || [];
+
+  for (const [key, val] of Object.entries(tool.schema.properties)) {
+    // Include required props and the first optional prop with a default
+    if (required.includes(key) || val.default !== undefined) {
+      if (val.default !== undefined) {
+        example[key] = val.default;
+      } else if (val.enum && val.enum.length > 0) {
+        example[key] = val.enum[0];
+      } else if (val.type === 'string') {
+        example[key] = `<${key}>`;
+      } else if (val.type === 'object') {
+        example[key] = {};
+      } else {
+        example[key] = `<${key}>`;
+      }
+    }
+  }
+
+  // If nothing was required, include the first property as a hint
+  if (Object.keys(example).length === 0) {
+    const firstKey = Object.keys(tool.schema.properties)[0];
+    if (firstKey) {
+      const val = tool.schema.properties[firstKey];
+      example[firstKey] = val.default || (val.enum ? val.enum[0] : `<${firstKey}>`);
+    }
+  }
+
+  return example;
+}
+
+function _lateAnswersFileForReplay(projectManager, agentId, sessionId) {
+  if (!projectManager || !agentId || !sessionId) return null;
+  try {
+    const sessionDir = projectManager.getSessionDir(agentId, sessionId);
+    return path.join(sessionDir, 'ask-user-late-answers.json');
+  } catch {
+    return null;
+  }
+}
+
+function _injectQueuedAskUserAnswers(prompt, projectManager, agentId, sessionId, log = console) {
+  const filePath = _lateAnswersFileForReplay(projectManager, agentId, sessionId);
+  if (!filePath || !fs.existsSync(filePath)) return prompt;
+
+  let queued;
+  try {
+    queued = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return prompt;
+  }
+  if (!Array.isArray(queued) || queued.length === 0) return prompt;
+
+  const lines = [
+    '=== RECOVERED ASK-USER ANSWERS ===',
+    'The user answered these pending ask-user prompts while no tool call was awaiting input.',
+    'Treat these as the newest user inputs before processing the message below.',
+    '',
+  ];
+
+  for (let i = 0; i < queued.length; i++) {
+    const item = queued[i];
+    lines.push(`${i + 1}. Question: ${item.question || '(unknown)'}`);
+    lines.push(`   Answer: ${typeof item.answer === 'string' ? item.answer : JSON.stringify(item.answer)}`);
+  }
+
+  lines.push('', '=== END RECOVERED ASK-USER ANSWERS ===', '', 'Current user message:', prompt);
+
+  try {
+    fs.unlinkSync(filePath);
+  } catch { /* non-fatal */ }
+
+  log.info(`[_injectQueuedAskUserAnswers] Injected ${queued.length} recovered answer(s) for ${agentId}/${sessionId}`);
+  return lines.join('\n');
+}
+
+function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log) {
   const sessionId = msg.id || crypto.randomUUID();
   const { prompt, agent, options = {} } = msg;
 
@@ -662,19 +1031,21 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPoo
 
   let cliOptions;
   try {
-    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId);
+    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId, toolLoader, log);
   } catch (err) {
     reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
   }
 
-  // Assign a CLI session ID so we can resume later
+  // Assign a CLI session ID and agent ID so tool-cli.js can identify context
   cliOptions.sessionId = sessionId;
+  cliOptions.agentId = agent;
 
-  _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agent, log);
+  const effectivePrompt = _injectQueuedAskUserAnswers(prompt, projectManager, agent, sessionId, log);
+  _startStreamSession(ws, msg, sessionId, effectivePrompt, cliOptions, claudeStreamFn, projectManager, agent, anthropicClient, log);
 }
 
-function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, log) {
+function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log) {
   const { sessionId, prompt, agent, options = {} } = msg;
 
   if (!sessionId) {
@@ -688,7 +1059,7 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
 
   let cliOptions;
   try {
-    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId);
+    cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId, toolLoader, log);
   } catch (err) {
     reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
@@ -696,11 +1067,13 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
 
   // Use --resume to continue the conversation
   cliOptions.resumeSessionId = sessionId;
+  cliOptions.agentId = agent;
 
-  _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agent, log);
+  const effectivePrompt = _injectQueuedAskUserAnswers(prompt, projectManager, agent, sessionId, log);
+  _startStreamSession(ws, msg, sessionId, effectivePrompt, cliOptions, claudeStreamFn, projectManager, agent, anthropicClient, log);
 }
 
-function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agentId, log) {
+function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agentId, anthropicClient, log) {
   if (ws._csSessions.has(sessionId)) {
     reply(ws, msg, { type: 'session.error', sessionId, error: 'Session ID already active' });
     return;
@@ -713,6 +1086,21 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
   reply(ws, msg, { type: 'session.started', sessionId });
 
   log.info(`[claudeSocket] Starting session ${sessionId}: "${prompt.slice(0, 80)}..."`);
+
+  // Generate a short title via triage (Haiku) — fire-and-forget so it doesn't
+  // block the main stream. The title is pushed to the client as session.title
+  // and saved to session metadata.
+  let sessionTitle = prompt.slice(0, 100); // fallback: truncated prompt
+  const titlePromise = _generateSessionTitle(prompt, anthropicClient, log)
+    .then(title => {
+      sessionTitle = title;
+      if (ws.readyState === ws.OPEN && !aborted) {
+        sendJSON(ws, { type: 'session.title', sessionId, title });
+      }
+    })
+    .catch(err => {
+      log.warn(`[claudeSocket] Title generation failed, using fallback: ${err.message}`);
+    });
 
   // Log user prompt to conversation log
   if (agentId && projectManager) {
@@ -758,12 +1146,16 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
   };
 
   claudeStreamFn(prompt, cliOptions, onEvent)
-    .then(({ markdown, durationMs }) => {
+    .then(async ({ markdown, durationMs }) => {
+      // Wait for title generation to finish (it's fast — Haiku) so we save
+      // the proper title. If it already resolved, this is a no-op.
+      await titlePromise.catch(() => {}); // swallow errors, fallback already set
+
       // Save session metadata + conversation log
       if (agentId && projectManager) {
         try {
           projectManager.saveSession(agentId, sessionId, {
-            title: prompt.slice(0, 100),
+            title: sessionTitle,
             createdAt: Date.now() - durationMs,
             durationMs,
           });
@@ -819,6 +1211,37 @@ function handleSessionAbort(ws, msg, log) {
   session.abort();
   ws._csSessions.delete(sessionId);
   reply(ws, msg, { type: 'session.aborted', sessionId });
+}
+
+// ─── Title generation ─────────────────────────────────────────────────────────
+
+/**
+ * Generate a concise session title from the user's first prompt using Haiku.
+ * Returns the title string, or falls back to truncated prompt on error.
+ *
+ * @param {string} prompt     - The user's prompt
+ * @param {object} anthropicClient - Anthropic API client (may be null)
+ * @param {object} log
+ * @returns {Promise<string>}
+ */
+async function _generateSessionTitle(prompt, anthropicClient, log) {
+  if (!anthropicClient) {
+    return prompt.slice(0, 100);
+  }
+
+  const result = await anthropicClient.message({
+    model: 'haiku',
+    maxTokens: 40,
+    temperature: 0,
+    system: 'Generate a short title (max 8 words) that summarizes the user\'s request. Reply with ONLY the title, no quotes, no punctuation at the end, no explanation.',
+    messages: [{ role: 'user', content: prompt.slice(0, 500) }],
+  });
+
+  const title = (result.text || '').trim().replace(/^["']|["']$/g, '');
+  if (!title) return prompt.slice(0, 100);
+
+  log.info(`[claudeSocket] Generated session title: "${title}"`);
+  return title;
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────

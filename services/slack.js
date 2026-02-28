@@ -28,9 +28,30 @@ const { WebClient } = require('@slack/web-api');
 
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// ─── Service-level state (accessible by status()) ──────────────────────────
+
+let _connected = false;
+let _startedAt = 0;
+const _counters = { inbound: 0, outbound: 0, errors: 0, cacheMisses: 0 };
+let _cacheStats = { users: 0, channels: 0, loadedAt: 0 };
+let _workspace = 'default';
+
 module.exports = {
   name: 'slack',
   description: 'Slack Socket Mode — bidirectional message bridge',
+
+  /**
+   * Health status — called by serviceLoader.getStatus('slack').
+   */
+  status() {
+    return {
+      connected: _connected,
+      workspace: _workspace,
+      startedAt: _startedAt,
+      counters: { ..._counters },
+      cache: { ..._cacheStats },
+    };
+  },
 
   start(context) {
     const { messageBroker, log } = context;
@@ -38,6 +59,13 @@ module.exports = {
     const appToken = process.env.SLACK_APP_TOKEN;
     const botToken = process.env.SLACK_BOT_TOKEN;
     const workspace = process.env.SLACK_WORKSPACE || 'default';
+    _workspace = workspace;
+    _startedAt = Date.now();
+    _connected = false;
+    _counters.inbound = 0;
+    _counters.outbound = 0;
+    _counters.errors = 0;
+    _counters.cacheMisses = 0;
 
     if (!appToken) {
       log.warn('[slack-service] SLACK_APP_TOKEN not set — service disabled');
@@ -52,6 +80,10 @@ module.exports = {
 
     const socketClient = new SocketModeClient({ appToken });
     const webClient = new WebClient(botToken);
+
+    // Track connection state
+    socketClient.on('connected', () => { _connected = true; });
+    socketClient.on('disconnected', () => { _connected = false; });
 
     // Our own bot user ID — populated on connect
     let botUserId = null;
@@ -140,6 +172,7 @@ module.exports = {
     async function reloadCaches() {
       await Promise.all([loadUsers(), loadChannels()]);
       cacheLoadedAt = Date.now();
+      _cacheStats = { users: usersById.size, channels: channelsById.size, loadedAt: cacheLoadedAt };
     }
 
     // ─── Lookup helpers (cache-first, single-fetch fallback) ──────────────
@@ -148,6 +181,7 @@ module.exports = {
       if (usersById.has(userId)) return usersById.get(userId);
 
       // Cache miss — fetch single user and insert
+      _counters.cacheMisses++;
       try {
         const info = await webClient.users.info({ user: userId });
         const u = info.user;
@@ -169,6 +203,7 @@ module.exports = {
       if (channelsById.has(channelId)) return channelsById.get(channelId);
 
       // Cache miss — fetch single channel and insert
+      _counters.cacheMisses++;
       try {
         const info = await webClient.conversations.info({ channel: channelId });
         const ch = info.channel;
@@ -255,6 +290,7 @@ module.exports = {
         : `slack/${workspace}/#${channel.name}`;
 
       log.info(`[slack-service] Inbound: ${user.displayName} in ${isDM ? 'DM' : `#${channel.name}`}: ${text.slice(0, 80)}`);
+      _counters.inbound++;
 
       try {
         messageBroker.route(`slack/${workspace}/${user.displayName}`, brokerPath, {
@@ -279,6 +315,7 @@ module.exports = {
           externalId: event.ts,
         });
       } catch (err) {
+        _counters.errors++;
         log.error(`[slack-service] Failed to route inbound message: ${err.message}`);
       }
     });
@@ -293,6 +330,7 @@ module.exports = {
       const channel = await resolveChannel(event.item.channel);
       const brokerPath = `slack/${workspace}/#${channel.name}`;
 
+      _counters.inbound++;
       try {
         messageBroker.route(`slack/${workspace}/${user.displayName}`, brokerPath, {
           command: 'slack.reaction',
@@ -308,6 +346,7 @@ module.exports = {
           externalId: `reaction:${event.event_ts}`,
         });
       } catch (err) {
+        _counters.errors++;
         log.error(`[slack-service] Failed to route reaction: ${err.message}`);
       }
     });
@@ -325,6 +364,7 @@ module.exports = {
       const brokerPath = `slack/${workspace}/#${channel.name}`;
 
       log.info(`[slack-service] Mention by ${user.displayName} in #${channel.name}: ${(event.text || '').slice(0, 80)}`);
+      _counters.inbound++;
 
       try {
         messageBroker.route(`slack/${workspace}/${user.displayName}`, brokerPath, {
@@ -342,6 +382,7 @@ module.exports = {
           externalId: event.ts,
         });
       } catch (err) {
+        _counters.errors++;
         log.error(`[slack-service] Failed to route mention: ${err.message}`);
       }
     });
@@ -367,6 +408,7 @@ module.exports = {
       // Send a placeholder; the agent's real response comes via the outbound path.
       await ack({ text: `Got it — processing \`${cmd} ${text}\`...` });
 
+      _counters.inbound++;
       try {
         messageBroker.route(`slack/${workspace}/${user.displayName}`, `slack/${workspace}/#${channel.name}`, {
           command: 'slack.slash',
@@ -411,8 +453,10 @@ module.exports = {
             text: text || '',
             ...(blocks ? { blocks } : {}),
           });
+          _counters.outbound++;
           log.info(`[slack-service] Slash response sent via response_url: ${(text || '').slice(0, 80)}`);
         } catch (err) {
+          _counters.errors++;
           log.error(`[slack-service] Failed to send slash response: ${err.message}`);
         }
         return;
@@ -451,8 +495,10 @@ module.exports = {
         if (blocks) postArgs.blocks = blocks;
 
         const result = await webClient.chat.postMessage(postArgs);
+        _counters.outbound++;
         log.info(`[slack-service] Sent to ${targetChannel}: ${text.slice(0, 80)} (ts: ${result.ts})`);
       } catch (err) {
+        _counters.errors++;
         log.error(`[slack-service] Failed to send to ${targetChannel}: ${err.message}`);
       }
     });

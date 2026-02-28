@@ -323,6 +323,127 @@
       font-size: 13px; gap: 8px;
     }
     .empty-state .icon { font-size: 32px; opacity: 0.3; }
+
+    /* Ask-user modal */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 480px;
+      width: 90%;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.4);
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .modal-header .modal-icon {
+      width: 32px; height: 32px;
+      background: var(--accent-dim);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .modal-header .modal-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .modal-header .modal-agent {
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .modal-question {
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 16px;
+    }
+    .modal-context {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+      padding: 8px 12px;
+      background: var(--bg);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    .modal-options {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .modal-option {
+      padding: 10px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      text-align: left;
+      transition: all 0.15s;
+    }
+    .modal-option:hover {
+      border-color: var(--accent);
+      background: var(--surface2);
+    }
+    .modal-option.selected {
+      border-color: var(--accent);
+      background: var(--accent-dim);
+      color: #fff;
+    }
+    .modal-freeform {
+      margin-bottom: 16px;
+    }
+    .modal-freeform textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 13px;
+      font-family: inherit;
+      resize: vertical;
+      min-height: 60px;
+      outline: none;
+    }
+    .modal-freeform textarea:focus { border-color: var(--accent); }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .modal-btn {
+      padding: 8px 20px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+    }
+    .modal-btn:hover { border-color: var(--accent); }
+    .modal-btn.primary {
+      background: var(--accent-dim);
+      border-color: var(--accent-dim);
+      color: #fff;
+    }
+    .modal-btn.primary:hover { background: var(--accent); }
+    .modal-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -363,6 +484,7 @@
         <span class="agent-label" id="chatAgentLabel">No agent selected</span>
         <span class="session-label" id="chatSessionLabel"></span>
         <div style="margin-left:auto; display:flex; gap:6px;">
+          <button class="quick-action" onclick="resetSessionContext()" title="Clear session context on server" id="resetCtxBtn" style="color:var(--orange); border-color:var(--orange);">&#x21bb; Clear Context</button>
           <button class="quick-action" onclick="newSession()" title="Start new session">+ New Session</button>
           <button class="quick-action" onclick="loadHistory()" title="Load conversation history">History</button>
         </div>
@@ -426,6 +548,29 @@
     </div>
   </div>
 
+  <!-- Ask-user modal -->
+  <div class="modal-overlay" id="askUserModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-icon">?</div>
+        <div>
+          <div class="modal-title">Agent needs your input</div>
+          <div class="modal-agent" id="askUserAgent"></div>
+        </div>
+      </div>
+      <div class="modal-question" id="askUserQuestion"></div>
+      <div class="modal-context" id="askUserContext" style="display:none;"></div>
+      <div class="modal-options" id="askUserOptions"></div>
+      <div class="modal-freeform" id="askUserFreeform" style="display:none;">
+        <textarea id="askUserInput" placeholder="Type your response..."></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn" onclick="skipAskUser()">Skip</button>
+        <button class="modal-btn primary" id="askUserSubmitBtn" onclick="submitAskUser()">Submit</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 // ─── State ─────────────────────────────────────────────────────────
 let ws = null;
@@ -435,26 +580,57 @@ let selectedAgent = null;
 let selectedSession = null;
 let isStreaming = false;
 let streamBuffer = '';
+let currentAskUser = null; // { questionId, selectedOption }
+let shouldAutoReconnect = true;
+let reconnectTimer = null;
+let reconnectStartedAt = null;
+let reconnectAttempts = 0;
+const RECONNECT_WINDOW_MS = 60 * 1000;
+const RECONNECT_DELAY_MS = 1500;
+
+
+// ─── Restore cached credentials and auto-connect ──────────────────
+try {
+  const savedUrl = localStorage.getItem('oc_ws_url');
+  const savedToken = localStorage.getItem('oc_ws_token');
+  if (savedUrl) document.getElementById('wsUrl').value = savedUrl;
+  if (savedToken) document.getElementById('wsToken').value = savedToken;
+  if (savedUrl && savedToken) setTimeout(() => connect(), 100);
+} catch { /* private browsing */ }
 
 // ─── WebSocket Connection ──────────────────────────────────────────
 
 function toggleConnection() {
   if (ws && ws.readyState <= 1) {
+    shouldAutoReconnect = false;
+    stopReconnectLoop();
     ws.close();
+    ws = null;
+    setConnState('disconnected');
     return;
   }
+  shouldAutoReconnect = true;
   connect();
 }
 
-function connect() {
+function connect(fromReconnect = false) {
   const url = document.getElementById('wsUrl').value;
   const token = document.getElementById('wsToken').value;
   if (!url || !token) return;
+  if (ws && ws.readyState <= 1) return;
+  if (!fromReconnect) stopReconnectLoop();
+
+  // Cache credentials for next page load
+  try {
+    localStorage.setItem('oc_ws_url', url);
+    localStorage.setItem('oc_ws_token', token);
+  } catch { /* private browsing */ }
 
   setConnState('connecting');
   ws = new WebSocket(url);
 
   ws.onopen = () => {
+    stopReconnectLoop();
     logConsole('out', 'auth', { type: 'auth', token: '***' });
     ws.send(JSON.stringify({ type: 'auth', token }));
   };
@@ -478,11 +654,52 @@ function connect() {
   ws.onclose = () => {
     setConnState('disconnected');
     ws = null;
+    if (shouldAutoReconnect) scheduleReconnect();
   };
 
-  ws.onerror = () => {
-    setConnState('disconnected');
+  ws.onerror = (evt) => {
+    logConsole('err', 'ws.error', { message: 'WebSocket error', detail: String(evt?.message || '') });
   };
+}
+
+function stopReconnectLoop() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectStartedAt = null;
+  reconnectAttempts = 0;
+}
+
+function scheduleReconnect() {
+  if (!shouldAutoReconnect) return;
+  if (ws && ws.readyState <= 1) return;
+  if (!reconnectStartedAt) reconnectStartedAt = Date.now();
+
+  const elapsed = Date.now() - reconnectStartedAt;
+  if (elapsed >= RECONNECT_WINDOW_MS) {
+    stopReconnectLoop();
+    handleReconnectExhausted();
+    return;
+  }
+
+  reconnectAttempts += 1;
+  setConnState('connecting');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect(true);
+  }, RECONNECT_DELAY_MS);
+}
+
+function handleReconnectExhausted() {
+  setConnState('disconnected');
+  if (selectedSession) {
+    selectedSession = null;
+    document.getElementById('chatSessionLabel').textContent = '';
+  }
+  if (isStreaming) {
+    setStreaming(false);
+    streamBuffer = '';
+  }
+  addChatMessage('error', 'Disconnected for 60s. Session was closed. Start a new session to continue.');
 }
 
 function setConnState(state) {
@@ -567,6 +784,11 @@ function handleMessage(msg) {
     case 'msg.push':
     case 'msg.session.push':
       addChatMessage('system', `[Broker] ${msg.message?.from}: ${msg.message?.command || ''} → ${JSON.stringify(msg.message?.payload || {}).slice(0, 200)}`);
+      break;
+
+    // Ask-user: agent wants human input
+    case 'ask-user':
+      showAskUserModal(msg);
       break;
   }
 }
@@ -765,6 +987,21 @@ function newSession() {
   addChatMessage('system', 'Starting new session — send a message to begin.');
 }
 
+async function resetSessionContext() {
+  if (!selectedAgent || !selectedSession) {
+    addChatMessage('system', 'No active session to reset.');
+    return;
+  }
+  if (!confirm('Clear session context? Claude will lose all prior conversation context for this session.')) return;
+  try {
+    await send({ type: 'session.context.reset', agent: selectedAgent, sessionId: selectedSession });
+    clearChat();
+    addChatMessage('system', `Session context cleared. Send a message to continue with a fresh context.`);
+  } catch (err) {
+    addChatMessage('error', `Failed to reset context: ${err.message}`);
+  }
+}
+
 async function loadHistory() {
   if (!selectedAgent || !selectedSession) return;
   try {
@@ -907,6 +1144,128 @@ function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.textContent.toLowerCase() === name));
   document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + name));
 }
+
+// ─── Ask-user modal ─────────────────────────────────────────────────
+
+function showAskUserModal(msg) {
+  currentAskUser = { questionId: msg.questionId, selectedOption: null };
+
+  document.getElementById('askUserAgent').textContent = `Agent: ${msg.agentId || 'unknown'}`;
+  document.getElementById('askUserQuestion').textContent = msg.question;
+
+  // Context
+  const ctxEl = document.getElementById('askUserContext');
+  if (msg.context) {
+    ctxEl.textContent = msg.context;
+    ctxEl.style.display = 'block';
+  } else {
+    ctxEl.style.display = 'none';
+  }
+
+  // Options or freeform
+  const optionsEl = document.getElementById('askUserOptions');
+  const freeformEl = document.getElementById('askUserFreeform');
+  optionsEl.innerHTML = '';
+
+  if (msg.options && msg.options.length > 0) {
+    optionsEl.style.display = 'flex';
+    freeformEl.style.display = 'none';
+
+    for (const opt of msg.options) {
+      const btn = document.createElement('button');
+      btn.className = 'modal-option';
+      btn.textContent = opt;
+      btn.onclick = () => {
+        document.querySelectorAll('.modal-option').forEach(o => o.classList.remove('selected'));
+        btn.classList.add('selected');
+        currentAskUser.selectedOption = opt;
+      };
+      optionsEl.appendChild(btn);
+    }
+
+    // Also add a freeform option at the bottom
+    const customBtn = document.createElement('button');
+    customBtn.className = 'modal-option';
+    customBtn.textContent = '✎ Custom response...';
+    customBtn.style.color = 'var(--text-dim)';
+    customBtn.style.fontStyle = 'italic';
+    customBtn.onclick = () => {
+      optionsEl.style.display = 'none';
+      freeformEl.style.display = 'block';
+      document.getElementById('askUserInput').focus();
+      currentAskUser.selectedOption = null;
+    };
+    optionsEl.appendChild(customBtn);
+  } else {
+    optionsEl.style.display = 'none';
+    freeformEl.style.display = 'block';
+  }
+
+  document.getElementById('askUserInput').value = '';
+  document.getElementById('askUserModal').classList.add('active');
+
+  // Show in chat too
+  addChatMessage('system', `Agent is asking: "${msg.question}"`);
+
+  // Focus the input if freeform
+  if (!msg.options || msg.options.length === 0) {
+    setTimeout(() => document.getElementById('askUserInput').focus(), 100);
+  }
+}
+
+function submitAskUser() {
+  if (!currentAskUser) return;
+
+  let answer = currentAskUser.selectedOption;
+  if (!answer) {
+    answer = document.getElementById('askUserInput').value.trim();
+  }
+  if (!answer) return;
+
+  // Send response
+  if (ws && ws.readyState === 1) {
+    const msg = {
+      type: 'ask-user.response',
+      questionId: currentAskUser.questionId,
+      answer,
+    };
+    logConsole('out', msg.type, msg);
+    ws.send(JSON.stringify(msg));
+  }
+
+  addChatMessage('user', `[Answer] ${answer}`);
+  closeAskUserModal();
+}
+
+function skipAskUser() {
+  if (!currentAskUser) return;
+
+  if (ws && ws.readyState === 1) {
+    const msg = {
+      type: 'ask-user.response',
+      questionId: currentAskUser.questionId,
+      answer: '(skipped)',
+    };
+    logConsole('out', msg.type, msg);
+    ws.send(JSON.stringify(msg));
+  }
+
+  addChatMessage('system', 'Skipped question');
+  closeAskUserModal();
+}
+
+function closeAskUserModal() {
+  document.getElementById('askUserModal').classList.remove('active');
+  currentAskUser = null;
+}
+
+// Submit on Enter in the freeform input
+document.getElementById('askUserInput')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    submitAskUser();
+  }
+});
 
 // ─── Util ──────────────────────────────────────────────────────────
 

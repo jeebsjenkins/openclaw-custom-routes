@@ -46,6 +46,16 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
   }
 
   const { projectManager } = opts;
+  const bundledToolsDir = path.join(__dirname, '..', 'tools');
+
+  // serviceLoader can be set after creation (circular dependency: server creates
+  // toolLoader before serviceLoader, then sets it).
+  let _serviceLoader = opts.serviceLoader || null;
+
+  /**
+   * Set the serviceLoader reference (called by server.js after creation).
+   */
+  function setServiceLoader(sl) { _serviceLoader = sl; }
 
   // Cache: Map<cacheKey, Map<toolName, toolExport>>
   const cache = new Map();
@@ -114,10 +124,13 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
   function _getToolDirs(agentId) {
     const dirs = [];
 
-    // 1. Global tools (lowest priority)
+    // 1. Built-in tools bundled with this server repo (lowest priority)
+    dirs.push(bundledToolsDir);
+
+    // 2. Project global tools
     dirs.push(path.join(projectRoot, 'tools'));
 
-    // 2. Walk parent hierarchy (for nested agents)
+    // 3. Walk parent hierarchy (for nested agents)
     if (agentId) {
       const parts = agentId.split('/');
       for (let i = 1; i <= parts.length; i++) {
@@ -125,7 +138,13 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
       }
     }
 
-    return dirs;
+    // Keep order, drop duplicates and non-existent directories
+    const seen = new Set();
+    return dirs.filter((dir) => {
+      if (seen.has(dir)) return false;
+      seen.add(dir);
+      return fs.existsSync(dir);
+    });
   }
 
   /**
@@ -140,11 +159,15 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
     const tools = new Map();
     const dirs = _getToolDirs(agentId);
 
+    log.info(`[toolLoader] Loading tools for "${agentId || '__global__'}" from: ${dirs.join(', ') || '(none)'}`);
+
     for (const dir of dirs) {
       for (const [name, tool] of _scanToolDir(dir)) {
         tools.set(name, tool);
       }
     }
+
+    log.info(`[toolLoader] Loaded ${tools.size} tool(s) for "${agentId || '__global__'}": ${Array.from(tools.keys()).join(', ') || '(none)'}`);
 
     return tools;
   }
@@ -212,6 +235,11 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
       try { fullContext.agentConfig = projectManager.getAgentConfigRaw(agentId); } catch { /* non-fatal */ }
     }
 
+    // Inject serviceLoader for tools like service-status that manage services
+    if (_serviceLoader) {
+      fullContext.serviceLoader = _serviceLoader;
+    }
+
     return tool.execute(input, fullContext);
   }
 
@@ -222,7 +250,7 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
    */
   function refresh(agentId) {
     if (agentId) {
-      cache.delete(agentId);
+      cache.delete(agentId || '__global__');
     } else {
       cache.clear();
     }
@@ -233,6 +261,7 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
     listAgentTools,
     executeTool,
     refresh,
+    setServiceLoader,
   };
 }
 

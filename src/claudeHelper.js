@@ -54,8 +54,17 @@ function buildCommonArgs(options = {}) {
   if (options.model) {
     args.push('--model', options.model);
   }
+  if (options.permissionMode) {
+    args.push('--permission-mode', options.permissionMode);
+  }
   if (options.noSessionPersistence) {
     args.push('--no-session-persistence');
+  }
+  if (options.allowedTools && options.allowedTools.length > 0) {
+    args.push('--allowedTools', [].concat(options.allowedTools).join(','));
+  }
+  if (options.disallowedTools && options.disallowedTools.length > 0) {
+    args.push('--disallowedTools', [].concat(options.disallowedTools).join(','));
   }
   return args;
 }
@@ -87,11 +96,22 @@ function claudeStream(prompt, options = {}, onEvent) {
   const { cwd = os.tmpdir(), timeoutMs = DEFAULT_TIMEOUT_MS } = options;
 
   const args = ['-p', '--verbose', '--output-format', 'stream-json', ...buildCommonArgs(options)];
-  args.push(prompt);
+  // `--allowedTools/--disallowedTools` are variadic flags; add `--` so the
+  // trailing prompt cannot be consumed as another tool name.
+  args.push('--', prompt);
+
+  // Log CLI args for debugging (redact prompt to keep logs clean)
+  const debugArgs = args.slice(0, -1); // everything except the prompt
+  console.log(`[claudeStream] CLI args: claude ${debugArgs.join(' ')} "<prompt>"`);
 
   // Clean env: strip Claude Code internal vars. Secrets are NOT injected here —
   // they flow through toolLoader's executeTool() context so the LLM never sees them.
   const env = cleanEnv();
+
+  // Inject session context so tool-cli.js can identify itself without the
+  // agent LLM needing to know or pass these values explicitly.
+  if (options.sessionId)  env.TOOL_SESSION_ID = options.sessionId;
+  if (options.agentId)    env.TOOL_AGENT_ID   = options.agentId;
 
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
@@ -223,10 +243,15 @@ function claudeQuery(prompt, options = {}) {
   const { cwd = os.tmpdir(), timeoutMs = DEFAULT_TIMEOUT_MS } = options;
 
   const args = ['-p', '--verbose', '--output-format', 'json', ...buildCommonArgs(options)];
-  args.push(prompt);
+  // Keep prompt parsing stable when variadic tool flags are present.
+  args.push('--', prompt);
 
   // Clean env only — no secrets in subprocess. Tools get secrets via context.agentSecrets.
   const env = cleanEnv();
+
+  // Inject session context for tool-cli.js (same as claudeStream).
+  if (options.sessionId)  env.TOOL_SESSION_ID = options.sessionId;
+  if (options.agentId)    env.TOOL_AGENT_ID   = options.agentId;
 
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();

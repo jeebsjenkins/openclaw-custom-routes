@@ -5,7 +5,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test:socket:ask-loop": "node test/socket-ask-loop.js --port 3101"
   },
   "keywords": [
     "openclaw",

@@ -15,7 +15,20 @@
  *       // Return a cleanup function (or nothing)
  *       return () => { // cleanup };
  *     },
+ *     status() {                         // optional — called for health checks
+ *       // Return an object with service-specific health info.
+ *       // Convention: include a `connected` boolean and any counters.
+ *       return {
+ *         connected: true,
+ *         messagesRouted: 42,
+ *         cacheSize: 150,
+ *       };
+ *     },
  *   };
+ *
+ * Service registry:
+ *   The loader exposes a global registry so other modules (like tools)
+ *   can look up running services by name via getService(name).
  *
  * Hot-reload:
  *   Call refresh() to detect added/removed/changed service files.
@@ -171,23 +184,87 @@ function createServiceLoader(servicesDir, log = console) {
   }
 
   /**
-   * List running services.
+   * List running services with optional health status.
+   *
+   * @param {boolean} [includeStatus=false] - If true, call each service's status() and include it
+   * @returns {Array<{ name, description, loadedAt, uptimeMs, status? }>}
    */
-  function list() {
+  function list(includeStatus = false) {
     const result = [];
     for (const [name, entry] of running) {
-      result.push({
+      const info = {
         name,
         description: entry.module.description || '',
         filePath: entry.filePath,
         loadedAt: entry.loadedAt,
         uptimeMs: Date.now() - entry.loadedAt,
-      });
+      };
+
+      if (includeStatus) {
+        info.status = _getServiceStatus(name);
+      }
+
+      result.push(info);
     }
     return result;
   }
 
-  return { scan, startAll, stopAll, refresh, list };
+  /**
+   * Get a running service's module by name.
+   * Useful for tools or other modules that need to interact with a service directly.
+   *
+   * @param {string} name - Service name
+   * @returns {object|null} The service module (with start, status, etc.) or null
+   */
+  function getService(name) {
+    const entry = running.get(name);
+    return entry ? entry.module : null;
+  }
+
+  /**
+   * Get the health/status of a single service.
+   * Calls the service's status() function if it provides one.
+   *
+   * @param {string} name - Service name
+   * @returns {object} Status object with at least { running: true/false }
+   */
+  function _getServiceStatus(name) {
+    const entry = running.get(name);
+    if (!entry) return { running: false };
+
+    const base = { running: true, uptimeMs: Date.now() - entry.loadedAt };
+
+    if (typeof entry.module.status === 'function') {
+      try {
+        const svcStatus = entry.module.status();
+        return { ...base, ...svcStatus };
+      } catch (err) {
+        return { ...base, statusError: err.message };
+      }
+    }
+
+    return base;
+  }
+
+  /**
+   * Get status for a single service by name (public wrapper).
+   */
+  function getStatus(name) {
+    return _getServiceStatus(name);
+  }
+
+  /**
+   * Get status for all running services.
+   */
+  function getAllStatus() {
+    const result = {};
+    for (const name of running.keys()) {
+      result[name] = _getServiceStatus(name);
+    }
+    return result;
+  }
+
+  return { scan, startAll, stopAll, refresh, list, getService, getStatus, getAllStatus };
 }
 
 module.exports = { createServiceLoader };

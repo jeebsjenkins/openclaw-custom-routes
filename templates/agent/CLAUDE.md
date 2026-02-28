@@ -49,4 +49,19 @@ Your working directory is this agent folder. Here is how it is organized:
 
 ## Tools
 
-<!-- Document any custom tools in the tools/ directory -->
+You have access to server-side tools via the tool-cli bridge. These tools run in the
+server context with full access to services, messaging, and secrets — you never need
+to handle API keys or tokens directly.
+
+To list available tools and their parameters:
+```bash
+node src/tool-cli.js list --agent {{id}}
+```
+
+To execute a tool:
+```bash
+node src/tool-cli.js <tool-name> --agent {{id}} --input '<json>'
+```
+
+The full tool list with parameters is injected into your system prompt at session start.
+See the `=== AVAILABLE TOOLS ===` section for details.
