@@ -116,7 +116,7 @@ async function uploadSlackFile({ channel, content, filename, title, threadTs }) 
     content,
     filename: filename || 'response.md',
     title: title || 'Response',
-    // thread_ts: threadTs,
+    thread_ts: threadTs,
   });
 }
 
