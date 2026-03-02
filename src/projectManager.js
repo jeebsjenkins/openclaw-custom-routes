@@ -459,6 +459,26 @@ function createProjectManager(projectRoot) {
     }
   }
 
+  // ─── Session Error Logs ───────────────────────────────────────────────
+  // Session error logs are JSONL files scoped to sessions/{sessionId}/errors.jsonl
+
+  function appendSessionErrorLog(agentId, sessionId, entry) {
+    _ensureSessionDirs(agentId, sessionId);
+    const logPath = path.join(_sessionDir(agentId, sessionId), 'errors.jsonl');
+    const line = JSON.stringify({ ...entry, timestamp: Date.now() }) + '\n';
+    fs.appendFileSync(logPath, line);
+  }
+
+  function getSessionErrorLog(agentId, sessionId) {
+    const logPath = path.join(_sessionDir(agentId, sessionId), 'errors.jsonl');
+    try {
+      const content = fs.readFileSync(logPath, 'utf8');
+      return content.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    } catch {
+      return [];
+    }
+  }
+
   // ─── Session Directories ─────────────────────────────────────────────────
   // Each session gets its own directory tree for workspace, tmp, and memory.
 
@@ -682,6 +702,8 @@ function createProjectManager(projectRoot) {
     // Conversation logs (stored in sessions/ alongside metadata)
     appendConversationLog,
     getConversationLog,
+    appendSessionErrorLog,
+    getSessionErrorLog,
 
     // Memory (three-tier: system → agent → session)
     getSystemMemory,

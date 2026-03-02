@@ -12,6 +12,7 @@
 module.exports = {
   name: 'ask-user',
   description: 'Ask the user a question and wait for their response. Use this when you need clarification, approval, or a choice from the human operator. The question will appear as an interactive prompt in the dashboard.',
+  timeoutMs: 5 * 60 * 1000,
 
   schema: {
     type: 'object',

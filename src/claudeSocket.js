@@ -65,6 +65,11 @@
  *   { type: "session.start", id?, agent, prompt, options? }
  *   { type: "session.continue", agent, sessionId, prompt, options? }
  *   { type: "session.abort", sessionId }
+ *   { type: "status.active", agentId? }     // active turn snapshot
+ *
+ * Server → Client (push):
+ *   { type: "session.status", sessionId, agentId, status, startedAt?, endedAt?, durationMs?, reason?, error? }
+ *   { type: "agent.status", agentId, isWorking, activeSessions, activeCount }
  *
  * ── Conversation History ─────────────────────────────────────────────
  *   { type: "conversation.history", agent, sessionId }
@@ -152,6 +157,115 @@ function start(opts = {}) {
       fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
     } catch { /* non-fatal */ }
   }
+
+  // ─── Active session/agent status tracking ─────────────────────────────
+
+  const activeSessions = new Map(); // `${agentId}::${sessionId}` -> metadata
+
+  function _sessionKey(agentId, sessionId) {
+    return `${agentId || ''}::${sessionId || ''}`;
+  }
+
+  function _agentActiveSessions(agentId) {
+    const rows = [];
+    for (const [, meta] of activeSessions) {
+      if (meta.agentId === agentId) rows.push(meta);
+    }
+    return rows;
+  }
+
+  function _snapshotActive(agentId) {
+    const now = Date.now();
+    const sessions = [];
+    for (const [, meta] of activeSessions) {
+      if (agentId && meta.agentId !== agentId) continue;
+      sessions.push({
+        agentId: meta.agentId,
+        sessionId: meta.sessionId,
+        status: 'running',
+        startedAt: meta.startedAt,
+        elapsedMs: Math.max(0, now - meta.startedAt),
+        promptPreview: meta.promptPreview || null,
+      });
+    }
+
+    const agentIds = new Set(sessions.map(s => s.agentId));
+    const agents = Array.from(agentIds).map((id) => {
+      const agentSessions = sessions.filter(s => s.agentId === id);
+      return {
+        agentId: id,
+        isWorking: agentSessions.length > 0,
+        activeCount: agentSessions.length,
+        activeSessions: agentSessions.map(s => s.sessionId),
+      };
+    });
+
+    return { sessions, agents };
+  }
+
+  function _broadcastToAuthed(payload) {
+    for (const client of wss.clients) {
+      if (client._csAuthed && client.readyState === client.OPEN) {
+        sendJSON(client, payload);
+      }
+    }
+  }
+
+  function _emitAgentStatus(agentId) {
+    const agentSessions = _agentActiveSessions(agentId);
+    _broadcastToAuthed({
+      type: 'agent.status',
+      agentId,
+      isWorking: agentSessions.length > 0,
+      activeCount: agentSessions.length,
+      activeSessions: agentSessions.map(s => s.sessionId),
+    });
+  }
+
+  const sessionStatusRuntime = {
+    isActive(agentId, sessionId) {
+      return activeSessions.has(_sessionKey(agentId, sessionId));
+    },
+    markActive(agentId, sessionId, details = {}) {
+      const key = _sessionKey(agentId, sessionId);
+      const meta = {
+        agentId,
+        sessionId,
+        startedAt: Date.now(),
+        promptPreview: details.promptPreview || null,
+      };
+      activeSessions.set(key, meta);
+      _broadcastToAuthed({
+        type: 'session.status',
+        agentId,
+        sessionId,
+        status: 'running',
+        startedAt: meta.startedAt,
+        promptPreview: meta.promptPreview,
+      });
+      _emitAgentStatus(agentId);
+    },
+    markInactive(agentId, sessionId, details = {}) {
+      const key = _sessionKey(agentId, sessionId);
+      const existing = activeSessions.get(key);
+      if (!existing) return;
+      activeSessions.delete(key);
+      const endedAt = Date.now();
+      _broadcastToAuthed({
+        type: 'session.status',
+        agentId,
+        sessionId,
+        status: 'stopped',
+        startedAt: existing.startedAt,
+        endedAt,
+        durationMs: details.durationMs != null ? details.durationMs : Math.max(0, endedAt - existing.startedAt),
+        reason: details.reason || 'done',
+        error: details.error || null,
+      });
+      _emitAgentStatus(agentId);
+    },
+    snapshot: _snapshotActive,
+  };
 
   // ─── Pending user questions (ask-user tool) ────────────────────────────
   //
@@ -261,7 +375,15 @@ function start(opts = {}) {
   if (projectManager) {
     registerHandler('agent.list', (ws, msg) => {
       try {
-        const agents = projectManager.listAgents();
+        const agents = projectManager.listAgents().map((agent) => {
+          const active = _agentActiveSessions(agent.id);
+          return {
+            ...agent,
+            isWorking: active.length > 0,
+            activeCount: active.length,
+            activeSessions: active.map(s => s.sessionId),
+          };
+        });
         reply(ws, msg, { type: 'agent.list.result', agents });
       } catch (err) {
         reply(ws, msg, { type: 'agent.list.error', error: err.message });
@@ -326,7 +448,16 @@ function start(opts = {}) {
 
     registerHandler('session.list', (ws, msg) => {
       try {
-        const sessions = projectManager.listSessions(msg.agent);
+        const now = Date.now();
+        const sessions = projectManager.listSessions(msg.agent).map((session) => {
+          const active = activeSessions.get(_sessionKey(msg.agent, session.id));
+          return {
+            ...session,
+            isActive: !!active,
+            activeSince: active ? active.startedAt : null,
+            activeMs: active ? Math.max(0, now - active.startedAt) : 0,
+          };
+        });
         reply(ws, msg, { type: 'session.list.result', sessions });
       } catch (err) {
         reply(ws, msg, { type: 'session.list.error', error: err.message });
@@ -344,9 +475,18 @@ function start(opts = {}) {
   }
 
   // Session start/continue/abort always registered
-  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log));
-  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log));
+  registerHandler('session.start', (ws, msg) => handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, sessionStatusRuntime, log));
+  registerHandler('session.continue', (ws, msg) => handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, sessionStatusRuntime, log));
   registerHandler('session.abort', (ws, msg) => handleSessionAbort(ws, msg, log));
+  registerHandler('status.active', (ws, msg) => {
+    const snapshot = sessionStatusRuntime.snapshot(msg.agentId || null);
+    reply(ws, msg, {
+      type: 'status.active.result',
+      agentId: msg.agentId || null,
+      sessions: snapshot.sessions,
+      agents: snapshot.agents,
+    });
+  });
 
   // ─── Tool handlers ──────────────────────────────────────────────────────
 
@@ -378,9 +518,23 @@ function start(opts = {}) {
       };
       toolLoader.executeTool(msg.agentId, msg.toolName, msg.input || {}, context)
         .then(result => {
+          if (result?.isError) {
+            appendSessionError(projectManager, msg.agentId, msg.sessionId || null, {
+              type: 'agent.tool.result.error',
+              toolName: msg.toolName,
+              input: msg.input || {},
+              output: result.output,
+            });
+          }
           reply(ws, msg, { type: 'agent.tool.result', agentId: msg.agentId, toolName: msg.toolName, result });
         })
         .catch(err => {
+          appendSessionError(projectManager, msg.agentId, msg.sessionId || null, {
+            type: 'agent.tool.execute.error',
+            toolName: msg.toolName,
+            input: msg.input || {},
+            error: err.message,
+          });
           reply(ws, msg, { type: 'agent.tool.error', error: err.message });
         });
     });
@@ -1020,11 +1174,25 @@ function _injectQueuedAskUserAnswers(prompt, projectManager, agentId, sessionId,
   return lines.join('\n');
 }
 
-function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log) {
+function appendSessionError(projectManager, agentId, sessionId, entry) {
+  if (!projectManager || !agentId || !sessionId) return;
+  try {
+    projectManager.appendSessionErrorLog(agentId, sessionId, {
+      level: 'error',
+      ...entry,
+    });
+  } catch { /* non-fatal */ }
+}
+
+function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, sessionStatusRuntime, log) {
   const sessionId = msg.id || crypto.randomUUID();
   const { prompt, agent, options = {} } = msg;
 
   if (!prompt) {
+    appendSessionError(projectManager, agent, sessionId, {
+      type: 'session.start.validation.error',
+      error: 'prompt is required',
+    });
     reply(ws, msg, { type: 'session.error', sessionId, error: 'prompt is required' });
     return;
   }
@@ -1033,6 +1201,10 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPoo
   try {
     cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId, toolLoader, log);
   } catch (err) {
+    appendSessionError(projectManager, agent, sessionId, {
+      type: 'session.start.agent_options.error',
+      error: err.message,
+    });
     reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
   }
@@ -1042,10 +1214,10 @@ function handleSessionStart(ws, msg, claudeStreamFn, projectManager, agentCLIPoo
   cliOptions.agentId = agent;
 
   const effectivePrompt = _injectQueuedAskUserAnswers(prompt, projectManager, agent, sessionId, log);
-  _startStreamSession(ws, msg, sessionId, effectivePrompt, cliOptions, claudeStreamFn, projectManager, agent, anthropicClient, log);
+  _startStreamSession(ws, msg, sessionId, effectivePrompt, cliOptions, claudeStreamFn, projectManager, agent, anthropicClient, sessionStatusRuntime, log);
 }
 
-function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, log) {
+function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLIPool, toolLoader, anthropicClient, sessionStatusRuntime, log) {
   const { sessionId, prompt, agent, options = {} } = msg;
 
   if (!sessionId) {
@@ -1053,6 +1225,10 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
     return;
   }
   if (!prompt) {
+    appendSessionError(projectManager, agent, sessionId, {
+      type: 'session.continue.validation.error',
+      error: 'prompt is required',
+    });
     reply(ws, msg, { type: 'session.error', sessionId, error: 'prompt is required' });
     return;
   }
@@ -1061,6 +1237,10 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
   try {
     cliOptions = _resolveAgentOptions(agent, options, projectManager, agentCLIPool, sessionId, toolLoader, log);
   } catch (err) {
+    appendSessionError(projectManager, agent, sessionId, {
+      type: 'session.continue.agent_options.error',
+      error: err.message,
+    });
     reply(ws, msg, { type: 'session.error', sessionId, error: `Agent error: ${err.message}` });
     return;
   }
@@ -1070,17 +1250,33 @@ function handleSessionContinue(ws, msg, claudeStreamFn, projectManager, agentCLI
   cliOptions.agentId = agent;
 
   const effectivePrompt = _injectQueuedAskUserAnswers(prompt, projectManager, agent, sessionId, log);
-  _startStreamSession(ws, msg, sessionId, effectivePrompt, cliOptions, claudeStreamFn, projectManager, agent, anthropicClient, log);
+  _startStreamSession(ws, msg, sessionId, effectivePrompt, cliOptions, claudeStreamFn, projectManager, agent, anthropicClient, sessionStatusRuntime, log);
 }
 
-function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agentId, anthropicClient, log) {
+function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStreamFn, projectManager, agentId, anthropicClient, sessionStatusRuntime, log) {
+  if (sessionStatusRuntime?.isActive?.(agentId, sessionId)) {
+    reply(ws, msg, { type: 'session.error', sessionId, error: 'Session ID already active' });
+    return;
+  }
   if (ws._csSessions.has(sessionId)) {
     reply(ws, msg, { type: 'session.error', sessionId, error: 'Session ID already active' });
     return;
   }
 
   let aborted = false;
-  ws._csSessions.set(sessionId, { abort: () => { aborted = true; } });
+  let abortReason = null;
+  let endReason = 'done';
+  let endError = null;
+  let durationForStatus = null;
+  const startedAt = Date.now();
+
+  ws._csSessions.set(sessionId, {
+    abort: (reason = 'aborted') => {
+      aborted = true;
+      abortReason = reason;
+    },
+  });
+  sessionStatusRuntime?.markActive?.(agentId, sessionId, { promptPreview: prompt.slice(0, 120) });
 
   // Acknowledge immediately so the client can correlate the reqId
   reply(ws, msg, { type: 'session.started', sessionId });
@@ -1138,6 +1334,13 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
         sendJSON(ws, { type: 'session.tool_use_stop', sessionId, blockIndex: data.blockIndex });
         break;
       case 'tool_result':
+        if (data.isError) {
+          appendSessionError(projectManager, agentId, sessionId, {
+            type: 'session.tool_result.error',
+            toolId: data.id || null,
+            output: data.content,
+          });
+        }
         sendJSON(ws, { type: 'session.tool_result', sessionId, toolId: data.id, content: data.content, isError: data.isError });
         break;
       default:
@@ -1147,6 +1350,8 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
 
   claudeStreamFn(prompt, cliOptions, onEvent)
     .then(async ({ markdown, durationMs }) => {
+      endReason = aborted ? (abortReason || 'aborted') : 'done';
+      durationForStatus = durationMs;
       // Wait for title generation to finish (it's fast — Haiku) so we save
       // the proper title. If it already resolved, this is a no-op.
       await titlePromise.catch(() => {}); // swallow errors, fallback already set
@@ -1174,6 +1379,13 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
       }
     })
     .catch((err) => {
+      endReason = aborted ? (abortReason || 'aborted') : 'error';
+      endError = err.message;
+      durationForStatus = Date.now() - startedAt;
+      appendSessionError(projectManager, agentId, sessionId, {
+        type: 'session.error',
+        error: err.message,
+      });
       // Log errors to conversation log
       if (agentId && projectManager) {
         try {
@@ -1190,6 +1402,11 @@ function _startStreamSession(ws, msg, sessionId, prompt, cliOptions, claudeStrea
     })
     .finally(() => {
       ws._csSessions.delete(sessionId);
+      sessionStatusRuntime?.markInactive?.(agentId, sessionId, {
+        reason: endReason,
+        error: endError,
+        durationMs: durationForStatus != null ? durationForStatus : (Date.now() - startedAt),
+      });
       log.info(`[claudeSocket] Session ${sessionId} ended`);
     });
 }
@@ -1208,7 +1425,7 @@ function handleSessionAbort(ws, msg, log) {
   }
 
   log.info(`[claudeSocket] Aborting session ${sessionId}`);
-  session.abort();
+  session.abort('aborted_by_user');
   ws._csSessions.delete(sessionId);
   reply(ws, msg, { type: 'session.aborted', sessionId });
 }

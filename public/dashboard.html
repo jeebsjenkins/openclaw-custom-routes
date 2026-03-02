@@ -138,6 +138,29 @@
       color: var(--purple);
       font-style: italic;
       font-size: 12px;
+      padding: 0;
+    }
+    .msg.thinking details { padding: 0; margin: 0; }
+    .msg.thinking summary {
+      cursor: pointer;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text-dim);
+      user-select: none;
+      list-style: none;
+    }
+    .msg.thinking summary::before {
+      content: '▶ ';
+      font-style: normal;
+      font-size: 9px;
+    }
+    .msg.thinking details[open] summary::before {
+      content: '▼ ';
+    }
+    .msg.thinking .thinking-content {
+      padding: 4px 12px 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .msg.tool {
       align-self: flex-start;
@@ -484,6 +507,7 @@
         <span class="agent-label" id="chatAgentLabel">No agent selected</span>
         <span class="session-label" id="chatSessionLabel"></span>
         <div style="margin-left:auto; display:flex; gap:6px;">
+          <button class="quick-action" id="stopBtn" onclick="abortSession()" title="Stop the running agent" style="color:var(--red); border-color:var(--red); display:none;">&#x25A0; Stop</button>
           <button class="quick-action" onclick="resetSessionContext()" title="Clear session context on server" id="resetCtxBtn" style="color:var(--orange); border-color:var(--orange);">&#x21bb; Clear Context</button>
           <button class="quick-action" onclick="newSession()" title="Start new session">+ New Session</button>
           <button class="quick-action" onclick="loadHistory()" title="Load conversation history">History</button>
@@ -802,7 +826,7 @@ function handleStreamEvent(kind, text) {
     streamBuffer += text;
     updateStreamMessage(streamBuffer);
   } else if (kind === 'thinking') {
-    addChatMessage('thinking', text);
+    addThinkingMessage(text);
   } else if (kind === 'tool') {
     addChatMessage('tool', text);
   }
@@ -842,9 +866,18 @@ function setStreaming(active) {
   isStreaming = active;
   document.getElementById('streamingIndicator').className = 'streaming-indicator' + (active ? ' active' : '');
   document.getElementById('sendBtn').disabled = active || !ws || ws.readyState !== 1;
+  document.getElementById('stopBtn').style.display = active ? '' : 'none';
   if (!active) {
     currentStreamEl = null;
   }
+}
+
+function abortSession() {
+  if (!selectedSession || !isStreaming) return;
+  send({ type: 'session.abort', sessionId: selectedSession }).catch(() => {});
+  setStreaming(false);
+  streamBuffer = '';
+  addChatMessage('system', 'Session aborted by user.');
 }
 
 // ─── Chat UI ───────────────────────────────────────────────────────
@@ -857,6 +890,19 @@ function addChatMessage(role, text) {
   meta.className = 'msg-meta';
   meta.textContent = new Date().toLocaleTimeString();
   el.appendChild(meta);
+  document.getElementById('chatMessages').appendChild(el);
+  scrollChat();
+}
+
+function addThinkingMessage(text) {
+  const el = document.createElement('div');
+  el.className = 'msg thinking';
+  const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
+  el.innerHTML =
+    '<details>' +
+      '<summary>Thinking: ' + esc(preview) + '</summary>' +
+      '<div class="thinking-content">' + esc(text) + '</div>' +
+    '</details>';
   document.getElementById('chatMessages').appendChild(el);
   scrollChat();
 }

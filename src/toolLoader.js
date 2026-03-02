@@ -17,6 +17,7 @@
  * {
  *   name: string,
  *   description: string,
+ *   timeoutMs?: number,                     // Optional default request timeout
  *   schema: object,                         // JSON Schema for input validation
  *   execute: async (input, context) => ({   // Run the tool
  *     output: string|object,
@@ -59,6 +60,66 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
 
   // Cache: Map<cacheKey, Map<toolName, toolExport>>
   const cache = new Map();
+
+  function _toMessage(output) {
+    if (typeof output === 'string') return output;
+    if (output && typeof output === 'object') {
+      if (typeof output.message === 'string') return output.message;
+      if (typeof output.error === 'string') return output.error;
+      if (output.error && typeof output.error.message === 'string') return output.error.message;
+      try { return JSON.stringify(output); } catch { return String(output); }
+    }
+    return String(output);
+  }
+
+  function _normalizeToolResult(toolName, rawResult) {
+    const now = Date.now();
+    const base = {
+      tool: toolName,
+      timestamp: now,
+    };
+
+    if (!rawResult || typeof rawResult !== 'object') {
+      return {
+        isError: false,
+        output: { ok: true, ...base, data: rawResult },
+      };
+    }
+
+    // Already in common schema; preserve as-is.
+    if (rawResult.output && typeof rawResult.output === 'object' && typeof rawResult.output.ok === 'boolean') {
+      return {
+        ...rawResult,
+        isError: typeof rawResult.isError === 'boolean' ? rawResult.isError : !rawResult.output.ok,
+      };
+    }
+
+    if (rawResult.isError) {
+      const message = _toMessage(rawResult.output);
+      return {
+        isError: true,
+        output: {
+          ok: false,
+          ...base,
+          error: {
+            code: 'TOOL_ERROR',
+            message,
+            retryable: false,
+            details: rawResult.output,
+          },
+        },
+      };
+    }
+
+    return {
+      isError: false,
+      output: {
+        ok: true,
+        ...base,
+        data: rawResult.output,
+      },
+    };
+  }
 
   /**
    * Load a single tool file. Clears require cache for hot-reload.
@@ -187,7 +248,7 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
    * List all tools available to an agent with metadata (no execute fn).
    *
    * @param {string} agentId - Agent path ID
-   * @returns {object[]} Array of { name, description, schema }
+   * @returns {object[]} Array of { name, description, timeoutMs, schema }
    */
   function listAgentTools(agentId) {
     const tools = _getCachedTools(agentId);
@@ -197,6 +258,7 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
       result.push({
         name: tool.name,
         description: tool.description || '',
+        timeoutMs: Number(tool.timeoutMs) || undefined,
         schema: tool.schema || {},
       });
     }
@@ -233,6 +295,7 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
     if (projectManager) {
       try { fullContext.agentSecrets = projectManager.getAgentSecrets(agentId); } catch { /* non-fatal */ }
       try { fullContext.agentConfig = projectManager.getAgentConfigRaw(agentId); } catch { /* non-fatal */ }
+      fullContext.projectManager = projectManager;
     }
 
     // Inject serviceLoader for tools like service-status that manage services
@@ -240,7 +303,28 @@ function createToolLoader(projectRoot, log = console, opts = {}) {
       fullContext.serviceLoader = _serviceLoader;
     }
 
-    return tool.execute(input, fullContext);
+    try {
+      const rawResult = await tool.execute(input, fullContext);
+      return _normalizeToolResult(toolName, rawResult);
+    } catch (err) {
+      return {
+        isError: true,
+        output: {
+          ok: false,
+          tool: toolName,
+          timestamp: Date.now(),
+          error: {
+            code: 'TOOL_EXECUTION_EXCEPTION',
+            message: err.message,
+            retryable: false,
+            details: {
+              name: err.name || 'Error',
+              stack: err.stack || null,
+            },
+          },
+        },
+      };
+    }
   }
 
   /**

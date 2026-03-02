@@ -25,6 +25,8 @@
  */
 
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 // ── Parse args ──────────────────────────────────────────────────────────────
 
@@ -171,15 +173,59 @@ function sendAndWait(ws, message, timeoutMs = 30000) {
   });
 }
 
+async function resolveToolTimeout(ws, agentId, toolName) {
+  if (!agentId || !toolName) return null;
+  try {
+    const resp = await sendAndWait(ws, {
+      type: 'agent.tools.list',
+      agentId,
+    }, 10000);
+    if (resp.type !== 'agent.tools.list.result' || !Array.isArray(resp.tools)) {
+      return null;
+    }
+
+    const name = String(toolName).trim().toLowerCase();
+    const tool = resp.tools.find((t) => String(t?.name || '').trim().toLowerCase() === name);
+    if (!tool) return null;
+
+    const fromMeta = Number(tool.timeoutMs) || 0;
+    return fromMeta > 0 ? fromMeta : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveToolTimeoutFromLocalDefinition(toolName) {
+  try {
+    const toolsDir = path.join(__dirname, '..', 'tools');
+    if (!fs.existsSync(toolsDir)) return null;
+    const files = fs.readdirSync(toolsDir).filter((f) => f.endsWith('.js'));
+    const target = String(toolName || '').trim().toLowerCase();
+
+    for (const file of files) {
+      const fullPath = path.join(toolsDir, file);
+      try {
+        delete require.cache[require.resolve(fullPath)];
+        const mod = require(fullPath);
+        const name = String(mod?.name || '').trim().toLowerCase();
+        if (name !== target) continue;
+
+        const fromMeta = Number(mod?.timeoutMs) || 0;
+        return fromMeta > 0 ? fromMeta : null;
+      } catch {
+        // Skip invalid tool modules; this is best-effort fallback only.
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const { toolName, agentId, sessionId, input, timeoutMs: customTimeout } = parseArgs(process.argv);
-
-  // Tools that wait for human input get a longer default timeout
-  const INTERACTIVE_TOOLS = ['ask-user'];
-  const defaultTimeout = INTERACTIVE_TOOLS.includes(toolName) ? 6 * 60 * 1000 : 30000;
-  const requestTimeout = customTimeout || defaultTimeout;
 
   const port = parseInt(process.env.CLAUDE_SOCKET_PORT, 10) || 3101;
   const token = process.env.CLAUDE_SOCKET_TOKEN;
@@ -241,6 +287,10 @@ async function main() {
       printUsage();
       process.exit(1);
     }
+
+    const toolDefaultTimeout = await resolveToolTimeout(ws, agentId, toolName);
+    const localToolDefaultTimeout = toolDefaultTimeout || resolveToolTimeoutFromLocalDefinition(toolName);
+    const requestTimeout = customTimeout || localToolDefaultTimeout || 30000;
 
     const resp = await sendAndWait(ws, {
       type: 'agent.tool.execute',
