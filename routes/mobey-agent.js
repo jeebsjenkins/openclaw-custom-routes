@@ -14,9 +14,7 @@ const axios = require('axios');
  * }
  */
 
-// Slack credentials for mobey account (set via environment variable)
-const SLACK_TOKEN = process.env.MOBEY_SLACK_TOKEN;
-const SLACK_CHANNEL = 'C0AF2HY0D5M'; // #mobey channel
+const SLACK_CHANNEL = 'C0AF2HY0D5M'; // #mobey channel (default)
 
 module.exports = {
   path: '/api/mobey-agent',
@@ -31,7 +29,7 @@ module.exports = {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const { prompt, timeout, thread_ts } = req.body || {};
+    const { prompt, timeout, thread_ts, sender_name, channel } = req.body || {};
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid "prompt"' });
@@ -42,10 +40,10 @@ module.exports = {
       const response = await axios.post('http://127.0.0.1:3100/mobey', {
         prompt,
         timeout: timeout || 300000,
-        slackContext: {
-          token: SLACK_TOKEN,
-          channel: SLACK_CHANNEL,
-          thread_ts: thread_ts || undefined,  // optional threading
+        slack: {
+          channel: channel || SLACK_CHANNEL,
+          thread_ts: thread_ts || undefined,
+          sender_name: sender_name || undefined,
         },
       }, {
         timeout: (timeout || 300000) + 5000,  // slightly longer than mobey timeout

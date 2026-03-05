@@ -320,6 +320,7 @@ function start(opts = {}) {
         const questionId = crypto.randomUUID();
 
         const timer = setTimeout(() => {
+          log.warn(`[claudeSocket] ask-user timeout after ${ASK_USER_TIMEOUT_MS}ms for question ${questionId} (agent=${agentId}, session=${sessionId})`);
           pendingQuestions.delete(questionId);
           if (askUserIndex[questionId]) {
             askUserIndex[questionId].status = 'timed_out';
@@ -818,7 +819,11 @@ function start(opts = {}) {
 
   const heartbeat = setInterval(() => {
     for (const ws of wss.clients) {
-      if (ws._csAlive === false) { ws.terminate(); continue; }
+      if (ws._csAlive === false) {
+        log.warn(`[claudeSocket] Heartbeat timeout — terminating unresponsive client`);
+        ws.terminate();
+        continue;
+      }
       ws._csAlive = false;
       ws.ping();
     }
@@ -839,6 +844,7 @@ function start(opts = {}) {
 
     const authTimer = setTimeout(() => {
       if (!ws._csAuthed) {
+        log.warn(`[claudeSocket] Auth timeout after ${AUTH_TIMEOUT_MS}ms for ${clientAddr}`);
         sendJSON(ws, { type: 'auth.error', error: 'Authentication timeout' });
         ws.close(4001, 'Auth timeout');
       }

@@ -1,7 +1,8 @@
 const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
-const { sendSlackMessage, updateSlackMessage, uploadSlackFile, fetchThreadHistory, findRecentUserMessage, getUserInfo, mdToSlack } = require('../../src/slackHelper');
+const fs = require('fs');
+const { sendSlackMessage, updateSlackMessage, uploadSlackFile, fetchThreadHistory, findRecentUserMessage, getUserInfo, mdToSlack, downloadSlackFile } = require('../../src/slackHelper');
 const { mdToDocx, mdToHtml, mdToPdf, mdToTxt } = require('../../src/mdConverter');
 const { sendEmail } = require('../../src/emailHelper');
 const { claudeStream, cleanEnv } = require('../../src/claudeHelper');
@@ -192,6 +193,12 @@ async function sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_e
       return res.status(status || 500).json(body);
     }
 
+    // When Slack delivery already happened, return JSON summary instead of
+    // raw binary — the caller (e.g. mobey-agent) needs a parseable response.
+    if (statusMsg) {
+      return res.json({ status: 'ok', format: fmt, prompt: answer.prompt, durationMs: answer.durationMs, delivered: 'slack' });
+    }
+
     if (cfg.convert) {
       const buf = await cfg.convert(answer.markdown);
       res.set('Content-Type', cfg.contentType);
@@ -252,6 +259,7 @@ module.exports = {
 
       // Load prior thread context if we're replying in a thread
       let threadContext = '';
+      let threadFilesDir = null;
       if (statusMsg?.threadTs) {
         try {
           const messages = await fetchThreadHistory({
@@ -262,6 +270,35 @@ module.exports = {
           const prior = messages.slice(0, -1).filter(m => m.text && !m.text.startsWith('On it'));
           if (prior.length) {
             threadContext = prior.map(m => `[thread] ${m.text}`).join('\n') + '\n\n';
+          }
+
+          // Collect all files from prior messages in the thread
+          const allFiles = prior.flatMap(m => m.files || []);
+          if (allFiles.length) {
+            threadFilesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mobey-thread-'));
+            const fileDescriptions = [];
+
+            await Promise.all(allFiles.map(async (file) => {
+              try {
+                const buf = await downloadSlackFile(file.url);
+                const filePath = path.join(threadFilesDir, file.name);
+                fs.writeFileSync(filePath, buf);
+
+                // For text-based files, inline the content in the prompt context
+                const textTypes = ['.md', '.txt', '.html', '.csv', '.json', '.js', '.ts', '.py', '.rb', '.sh', '.yml', '.yaml', '.xml', '.sql'];
+                const ext = path.extname(file.name).toLowerCase();
+                if (textTypes.includes(ext) && buf.length < 100_000) {
+                  fileDescriptions.push(`[thread file: ${file.name}]\n${buf.toString('utf-8')}\n[/thread file]`);
+                } else {
+                  fileDescriptions.push(`[thread file: ${file.name} (saved to ${filePath}, ${file.mimetype}, ${file.size} bytes)]`);
+                }
+              } catch (dlErr) {
+                console.error(`Failed to download thread file ${file.name}:`, dlErr.message);
+                fileDescriptions.push(`[thread file: ${file.name} — could not download]`);
+              }
+            }));
+
+            threadContext += fileDescriptions.join('\n') + '\n\n';
           }
         } catch (err) {
           console.error('Failed to fetch thread history:', err.message);
@@ -321,11 +358,16 @@ module.exports = {
 
       let answer;
       try {
-        const result = await claudeStream(fullPrompt, {
+        const cliOpts = {
           cwd: MOBE_DIR,
           systemPrompt: SYSTEM_PROMPT,
           timeoutMs,
-        }, (type, data) => {
+        };
+        // Make downloaded thread files available to the CLI
+        if (threadFilesDir) {
+          cliOpts.additionalDirs = [threadFilesDir];
+        }
+        const result = await claudeStream(fullPrompt, cliOpts, (type, data) => {
           updateSlackStatus(type, data);
         });
         answer = { ok: true, markdown: result.markdown, prompt, durationMs: result.durationMs };
@@ -338,6 +380,10 @@ module.exports = {
         }
       } finally {
         running--;
+        // Clean up temp thread files directory
+        if (threadFilesDir) {
+          try { fs.rmSync(threadFilesDir, { recursive: true }); } catch { /* ignore */ }
+        }
       }
 
       await sendAnswer({ res, statusMsg, updateSlackStatus, answer, respond_email, format, prompt, slackUser, shortPrompt });

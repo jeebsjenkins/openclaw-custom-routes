@@ -127,6 +127,7 @@ function createAnthropicClient(opts = {}) {
         throw new Error(`Anthropic API ${status}: ${msg}`);
       }
       if (err.code === 'ECONNABORTED') {
+        log.error(`[anthropicHelper] Anthropic API timeout after ${reqTimeout || timeoutMs}ms (model=${resolvedModel})`);
         throw new Error(`Anthropic API timeout after ${reqTimeout || timeoutMs}ms`);
       }
       throw err;

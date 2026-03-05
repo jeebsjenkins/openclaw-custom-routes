@@ -117,6 +117,7 @@ function connect(port, token, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
     const timer = setTimeout(() => {
+      console.error(`[tool-cli] Connection timeout after ${timeoutMs}ms (port=${port})`);
       ws.terminate();
       reject(new Error(`Connection timeout after ${timeoutMs}ms`));
     }, timeoutMs);
@@ -156,6 +157,7 @@ function sendAndWait(ws, message, timeoutMs = 30000) {
     message.reqId = reqId;
 
     const timer = setTimeout(() => {
+      console.error(`[tool-cli] Request timeout after ${timeoutMs}ms (reqId=${reqId})`);
       reject(new Error(`Request timeout after ${timeoutMs}ms`));
     }, timeoutMs);
 

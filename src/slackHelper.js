@@ -3,17 +3,59 @@ const config = require('../config');
 
 const slack = new WebClient(config.mobeySlackBotToken);
 
+// Channel name → ID cache (populated on first lookup)
+const channelIdCache = new Map();
+
+/**
+ * Resolve a channel identifier to a Slack channel ID.
+ * Accepts channel IDs (pass-through), #names, or bare names.
+ * @param {string} channel - Channel ID, #name, or bare name
+ * @returns {Promise<string>} Resolved channel ID
+ */
+async function resolveChannelId(channel) {
+  if (!channel) return channel;
+
+  // Already a channel ID (starts with C, D, or G)
+  if (/^[CDG][A-Z0-9]+$/.test(channel)) return channel;
+
+  const name = channel.replace(/^#/, '').toLowerCase();
+
+  // Check cache
+  if (channelIdCache.has(name)) return channelIdCache.get(name);
+
+  // Look up via conversations.list (paginated)
+  let cursor;
+  try {
+    do {
+      const res = await slack.conversations.list({
+        limit: 200,
+        cursor,
+        types: 'public_channel,private_channel',
+      });
+      for (const ch of res.channels || []) {
+        if (ch.name) channelIdCache.set(ch.name.toLowerCase(), ch.id);
+      }
+      cursor = res.response_metadata?.next_cursor;
+    } while (cursor);
+  } catch (err) {
+    console.error(`[slackHelper] Failed to list channels for resolution: ${err.message}`);
+  }
+
+  return channelIdCache.get(name) || channel; // fall back to original if not found
+}
+
 /**
  * Send a Slack message via the Slack Web API.
  * @param {Object} options
- * @param {string} options.channel - Slack channel (e.g. '#mobey' or channel ID)
+ * @param {string} options.channel - Slack channel (ID, #name, or bare name)
  * @param {string} options.message - The message text to send
  * @param {string} [options.threadTs] - Thread timestamp for replying in a thread
  * @returns {Promise<Object>} The Slack API response
  */
 async function sendSlackMessage({ channel, message, threadTs }) {
+  const resolvedChannel = await resolveChannelId(channel);
   const params = {
-    channel,
+    channel: resolvedChannel,
     text: message,
   };
 
@@ -33,8 +75,9 @@ async function sendSlackMessage({ channel, message, threadTs }) {
  * @returns {Promise<Object>} The Slack API response
  */
 async function updateSlackMessage({ channel, ts, message }) {
+  const resolvedChannel = await resolveChannelId(channel);
   return slack.chat.update({
-    channel,
+    channel: resolvedChannel,
     ts,
     text: message,
   });
@@ -80,8 +123,9 @@ async function getUserInfo(username, refreshCache = false) {
  * @returns {Promise<Array<{user: string, text: string, ts: string}>>}
  */
 async function fetchThreadHistory({ channel, threadTs, limit = 20 }) {
+  const resolvedChannel = await resolveChannelId(channel);
   const result = await slack.conversations.replies({
-    channel,
+    channel: resolvedChannel,
     ts: threadTs,
     limit,
   });
@@ -89,6 +133,12 @@ async function fetchThreadHistory({ channel, threadTs, limit = 20 }) {
     user: m.user,
     text: m.text,
     ts: m.ts,
+    files: (m.files || []).map(f => ({
+      name: f.name,
+      mimetype: f.mimetype,
+      url: f.url_private_download || f.url_private,
+      size: f.size,
+    })),
   }));
 }
 
@@ -102,8 +152,9 @@ async function fetchThreadHistory({ channel, threadTs, limit = 20 }) {
  * @returns {Promise<string|null>} The message ts, or null if not found
  */
 async function findRecentUserMessage({ channel, userId, limit = 10 }) {
+  const resolvedChannel = await resolveChannelId(channel);
   const result = await slack.conversations.history({
-    channel,
+    channel: resolvedChannel,
     limit,
   });
   const msg = (result.messages || []).find(m => m.user === userId);
@@ -111,13 +162,35 @@ async function findRecentUserMessage({ channel, userId, limit = 10 }) {
 }
 
 async function uploadSlackFile({ channel, content, filename, title, threadTs }) {
-  return slack.files.uploadV2({
-    channel_id: channel,
-    content,
+  const resolvedChannel = await resolveChannelId(channel);
+  const params = {
+    channel_id: resolvedChannel,
     filename: filename || 'response.md',
     title: title || 'Response',
     thread_ts: threadTs,
+  };
+  // Use `file` for Buffers (binary formats like docx/pdf), `content` for strings
+  if (Buffer.isBuffer(content)) {
+    params.file = content;
+  } else {
+    params.content = content;
+  }
+  return slack.files.uploadV2(params);
+}
+
+/**
+ * Download a file from Slack using the bot token for authentication.
+ * @param {string} url - The url_private or url_private_download URL
+ * @returns {Promise<Buffer>} The file contents as a Buffer
+ */
+async function downloadSlackFile(url) {
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${config.mobeySlackBotToken}` },
   });
+  if (!resp.ok) {
+    throw new Error(`Failed to download Slack file: ${resp.status} ${resp.statusText}`);
+  }
+  return Buffer.from(await resp.arrayBuffer());
 }
 
 function mdToSlack(md) {
@@ -140,4 +213,6 @@ module.exports = {
   findRecentUserMessage,
   getUserInfo,
   mdToSlack,
+  resolveChannelId,
+  downloadSlackFile,
 };

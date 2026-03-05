@@ -202,9 +202,13 @@ function claudeStream(prompt, options = {}, onEvent) {
     });
 
     const timer = setTimeout(() => {
+      console.error(`[claudeStream] Timeout after ${timeoutMs}ms — killing process (SIGTERM)`);
       proc.kill('SIGTERM');
       setTimeout(() => {
-        if (!proc.killed) proc.kill('SIGKILL');
+        if (!proc.killed) {
+          console.error(`[claudeStream] Process did not exit after SIGTERM — sending SIGKILL`);
+          proc.kill('SIGKILL');
+        }
       }, 5000);
     }, timeoutMs);
 
@@ -267,9 +271,13 @@ function claudeQuery(prompt, options = {}) {
     proc.stderr.on('data', (chunk) => { stderr += chunk; });
 
     const timer = setTimeout(() => {
+      console.error(`[claudeQuery] Timeout after ${timeoutMs}ms — killing process (SIGTERM)`);
       proc.kill('SIGTERM');
       setTimeout(() => {
-        if (!proc.killed) proc.kill('SIGKILL');
+        if (!proc.killed) {
+          console.error(`[claudeQuery] Process did not exit after SIGTERM — sending SIGKILL`);
+          proc.kill('SIGKILL');
+        }
       }, 5000);
     }, timeoutMs);
 

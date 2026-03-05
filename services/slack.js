@@ -481,6 +481,9 @@ module.exports = {
         const resolved = findChannelByName(targetChannel);
         if (resolved) {
           targetChannel = resolved;
+        } else {
+          log.warn(`[slack-service] Could not resolve channel name "${targetChannel}" to an ID — aborting send`);
+          return;
         }
       }
 
